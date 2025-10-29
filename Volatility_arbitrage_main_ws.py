@@ -15,6 +15,8 @@ from __future__ import annotations
 import json, time, threading, ssl
 from typing import Callable, List, Optional, Any, Dict
 
+__all__ = ["ws_watch_by_ids", "verify_ws_connection", "WsConnectivityError"]
+
 try:
     import websocket  # websocket-client
 except Exception:
@@ -27,10 +29,16 @@ def _now() -> str:
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
 
+class WsConnectivityError(RuntimeError):
+    """WS 握手 / 连接失败时抛出的统一异常。"""
+
+
 def ws_watch_by_ids(asset_ids: List[str],
                     label: str = "",
                     on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-                    verbose: bool = False):
+                    verbose: bool = False,
+                    max_retries: int = 3,
+                    retry_delay: float = 5.0):
     """
     只负责：连接 → 订阅 → 将 WS 事件回调给 on_event（逐条 dict）。
     - asset_ids: 订阅的 token_ids（字符串）
@@ -106,20 +114,58 @@ def ws_watch_by_ids(asset_ids: List[str],
         "Origin: https://polymarket.com",
         "User-Agent: Mozilla/5.0",
     ]
+    url = WS_BASE + "/ws/" + CHANNEL
     wsa = websocket.WebSocketApp(
-        WS_BASE + "/ws/" + CHANNEL,
+        url,
         on_open=on_open,
         on_message=on_message,
         on_error=on_error,
         on_close=on_close,
         header=headers,
     )
-    # 原生 ping 帧（双保险）
-    wsa.run_forever(
-        sslopt={"cert_reqs": ssl.CERT_REQUIRED},
-        ping_interval=25,
-        ping_timeout=10,
-    )
+
+    attempt = 0
+    last_exc: Optional[BaseException] = None
+    while True:
+        attempt += 1
+        try:
+            # 原生 ping 帧（双保险）
+            wsa.run_forever(
+                sslopt={"cert_reqs": ssl.CERT_REQUIRED},
+                ping_interval=25,
+                ping_timeout=10,
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            if verbose:
+                print(f"[{_now()}][WS][ERROR] run_forever exception: {exc!r}")
+            if attempt >= max_retries:
+                raise WsConnectivityError(f"WS 连接在 {attempt} 次尝试后仍失败：{url}") from exc
+            time.sleep(max(0.5, float(retry_delay)))
+
+
+def verify_ws_connection(timeout: float = 5.0,
+                         retries: int = 3,
+                         retry_delay: float = 2.0) -> Dict[str, Any]:
+    """快速握手自检：确保 WS 地址可连接。"""
+    url = WS_BASE + "/ws/" + CHANNEL
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, int(max(1, retries)) + 1):
+        try:
+            conn = websocket.create_connection(
+                url,
+                timeout=float(timeout),
+                sslopt={"cert_reqs": ssl.CERT_REQUIRED},
+            )
+            conn.close()
+            return {"url": url, "attempts": attempt}
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= retries:
+                raise WsConnectivityError(f"无法握手连接 {url}") from exc
+            time.sleep(max(0.5, float(retry_delay)))
+    raise WsConnectivityError(f"无法握手连接 {url}") from last_exc
 
 # --- 仅供独立运行调试 ---
 def _parse_cli(argv: List[str]) -> Optional[str]:
