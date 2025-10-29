@@ -13,7 +13,10 @@
 2) `execute_auto_sell`：
    - 维持原有的五档让利 FOK 卖单执行器，职责单一。
 
-模块对外暴露：`run_batch_buy` 与 `execute_auto_sell`。
+3) `monitor_profit_and_sell`：
+   - 参考 `auto_sell_pnl.py` 整合盈亏监控、卖出与到期 claim。
+
+模块对外暴露：`run_batch_buy`、`execute_auto_sell` 与 `monitor_profit_and_sell`。
 """
 
 from __future__ import annotations
@@ -21,7 +24,10 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any, Iterable, List
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, Iterable, List, Tuple
+
+import requests
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType
@@ -30,7 +36,11 @@ from py_clob_client.order_builder.constants import SELL
 from Volatility_buy import execute_auto_buy
 from Volatility_fliter import get_filtered_markets
 
-__all__ = ["run_batch_buy", "execute_auto_sell"]
+__all__ = [
+    "run_batch_buy",
+    "execute_auto_sell",
+    "monitor_profit_and_sell",
+]
 
 
 @dataclass
@@ -57,6 +67,50 @@ class BuyOrderResult:
         if self.response is not None:
             payload["response"] = dict(self.response)
         return payload
+
+
+@dataclass
+class PositionSnapshot:
+    token_id: str
+    size: float
+    average_price: Optional[float]
+    percent_pnl: Optional[float]
+    market: Dict[str, Any]
+    raw: Dict[str, Any]
+
+    @property
+    def pnl_ratio(self) -> float:
+        value = _parse_float(self.percent_pnl, default=0.0)
+        if value is None:
+            return 0.0
+        if value > 1.0:
+            return float(value) / 100.0
+        return float(value)
+
+    @property
+    def pnl_percent(self) -> float:
+        return float(self.pnl_ratio * 100.0)
+
+    @property
+    def size_real(self) -> float:
+        return max(0.0, float(self.size))
+
+    def is_profitable(self, threshold: float) -> bool:
+        if self.size_real <= 0:
+            return False
+        return self.pnl_ratio >= float(threshold)
+
+    def is_claimable(self) -> bool:
+        raw = self.raw or {}
+        flags = [
+            raw.get("claimable"),
+            raw.get("isClaimable"),
+            raw.get("claimStatus"),
+            raw.get("resolved"),
+            raw.get("isResolved"),
+            raw.get("status") == "RESOLVED",
+        ]
+        return any(bool(flag) for flag in flags)
 
 
 def _parse_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -198,6 +252,155 @@ def _resolve_profit_threshold(
     if ratio <= 0:
         ratio = default_profit_threshold
     return float(ratio)
+
+
+def _guess_wallet_address(client: ClobClient) -> Optional[str]:
+    for attr in (
+        "wallet_address",
+        "walletAddress",
+        "address",
+        "account_address",
+        "default_address",
+        "defaultAddress",
+        "funder",
+        "proxy_address",
+        "proxyAddress",
+    ):
+        if hasattr(client, attr):
+            value = getattr(client, attr)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _normalize_wallet_address(address: Optional[str]) -> Optional[str]:
+    if not address:
+        return None
+    text = str(address).strip()
+    if not text:
+        return None
+    if text.startswith("0x"):
+        return text
+    return text
+
+
+def _fetch_positions(
+    wallet_address: str,
+    *,
+    limit: int = 200,
+    size_threshold: float = 0.01,
+) -> List[Dict[str, Any]]:
+    url = "https://data-api.polymarket.com/positions"
+    params = {
+        "user": wallet_address,
+        "limit": int(max(1, limit)),
+        "sizeThreshold": float(max(0.0, size_threshold)),
+        "sortBy": "PERCENTPNL",
+        "sortDirection": "DESC",
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+    except Exception as exc:
+        print(f"[WARN] 获取持仓失败：{exc!r}")
+    return []
+
+
+def _build_position_snapshot(entry: Dict[str, Any]) -> Optional[PositionSnapshot]:
+    if not isinstance(entry, dict):
+        return None
+    token_id = entry.get("asset") or entry.get("tokenId") or entry.get("token_id")
+    if not token_id:
+        return None
+    size = _parse_float(entry.get("size"), default=0.0) or 0.0
+    avg_price = _parse_float(entry.get("averagePrice"), default=None)
+    percent_pnl = entry.get("percentPnl") or entry.get("pnlPercent")
+    market = entry.get("market") or entry.get("info") or {}
+    if not isinstance(market, dict):
+        market = {}
+    return PositionSnapshot(
+        token_id=str(token_id),
+        size=float(size),
+        average_price=avg_price,
+        percent_pnl=_parse_float(percent_pnl, default=None),
+        market=market,
+        raw=dict(entry),
+    )
+
+
+def _collect_position_snapshots(entries: List[Dict[str, Any]]) -> List[PositionSnapshot]:
+    snapshots: List[PositionSnapshot] = []
+    for entry in entries:
+        snap = _build_position_snapshot(entry)
+        if snap is not None:
+            snapshots.append(snap)
+    return snapshots
+
+
+def _fetch_best_bid(client: ClobClient, token_id: str) -> Optional[float]:
+    if hasattr(client, "get_price"):
+        try:
+            resp = client.get_price(token_id=str(token_id), side="buy")
+            if isinstance(resp, dict):
+                price = resp.get("price")
+                value = _parse_float(price, default=None)
+                if value is not None:
+                    return float(value)
+        except Exception:
+            pass
+    # 回退：尝试公开行情接口
+    url = f"https://clob.polymarket.com/prices/{token_id}/buy"
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        price = None
+        if isinstance(data, dict):
+            price = data.get("price") or data.get("value")
+        elif isinstance(data, list) and data:
+            price = data[0]
+        value = _parse_float(price, default=None)
+        if value is not None:
+            return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def _try_claim_position(client: ClobClient, token_id: str) -> Optional[Any]:
+    methods = [
+        "claim_positions",
+        "claim_position",
+        "claim_market",
+        "claim",
+        "claimPositions",
+    ]
+    last_exc: Optional[BaseException] = None
+    for name in methods:
+        if not hasattr(client, name):
+            continue
+        handler = getattr(client, name)
+        for payload in ([token_id], token_id):
+            try:
+                result = handler(payload)
+                print(f"[TRADE][CLAIM] token_id={token_id} method={name} payload={payload}")
+                return result
+            except TypeError:
+                continue
+            except Exception as exc:  # pragma: no cover - 仅记录错误
+                last_exc = exc
+                print(f"[WARN] claim 方法 {name} 调用失败：{exc!r}")
+                break
+    if last_exc is not None:
+        print(f"[WARN] 未能完成 token_id={token_id} 的 claim：{last_exc!r}")
+    else:
+        print(f"[WARN] 当前 client 不支持自动 claim（token_id={token_id}）。")
+    return None
 
 
 def run_batch_buy(
@@ -356,3 +559,175 @@ def execute_auto_sell(
 
     print("[Volatility_sell] All attempts failed.")
     return last_resp
+
+
+def _format_market_label(market: Dict[str, Any]) -> str:
+    if not market:
+        return "(unknown market)"
+    parts = []
+    title = market.get("title") or market.get("question")
+    if title:
+        parts.append(str(title))
+    outcome = market.get("outcome") or market.get("side")
+    if outcome:
+        parts.append(str(outcome))
+    return " | ".join(parts) if parts else str(market)
+
+
+def _log_iteration_header(iteration: int, ratio: float) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(
+        f"[RUN] 盈利监控轮次 {iteration} @ {now} (threshold={ratio * 100:.2f}%)"
+    )
+
+
+def _inspect_positions(
+    entries: List[PositionSnapshot],
+    *,
+    profit_ratio: float,
+) -> Tuple[List[PositionSnapshot], List[PositionSnapshot]]:
+    profitable: List[PositionSnapshot] = []
+    claimables: List[PositionSnapshot] = []
+    for snap in entries:
+        label = _format_market_label(snap.market)
+        print(
+            f"[PX] token_id={snap.token_id} size={snap.size_real:.4f} avg={snap.average_price} pnl={snap.pnl_percent:.2f}% -> {label}"
+        )
+        if snap.is_profitable(profit_ratio):
+            profitable.append(snap)
+        elif snap.is_claimable():
+            claimables.append(snap)
+    return profitable, claimables
+
+
+def _sell_positions(
+    client: ClobClient,
+    positions: List[PositionSnapshot],
+) -> List[Dict[str, Any]]:
+    responses: List[Dict[str, Any]] = []
+    for snap in positions:
+        best_bid = _fetch_best_bid(client, snap.token_id)
+        if best_bid is None:
+            print(
+                f"[WARN] 无法获取 token_id={snap.token_id} 的买一价，跳过卖出。"
+            )
+            continue
+        try:
+            resp = execute_auto_sell(client, snap.token_id, best_bid, snap.size_real)
+            if resp is not None:
+                responses.append(resp)
+        except Exception as exc:
+            print(
+                f"[ERR] 卖出失败 token_id={snap.token_id} bid={best_bid}: {exc!r}"
+            )
+    return responses
+
+
+def _claim_positions(client: ClobClient, claimables: List[PositionSnapshot]) -> None:
+    for snap in claimables:
+        print(
+            f"[HINT] token_id={snap.token_id} 市场已到期，尝试自动 claim。"
+        )
+        _try_claim_position(client, snap.token_id)
+
+
+def monitor_profit_and_sell(
+    client: ClobClient,
+    *,
+    profit_threshold: Optional[float] = None,
+    default_profit_threshold: float = 0.05,
+    check_interval: float = 600.0,
+    min_usdc_balance: float = 5.0,
+    wallet_address: Optional[str] = None,
+    max_cycles: Optional[int] = None,
+) -> Dict[str, Any]:
+    """每 10 分钟检查盈亏并在达标时执行卖出/claim。"""
+
+    profit_ratio = _resolve_profit_threshold(
+        profit_threshold, default_profit_threshold
+    )
+    wallet = _normalize_wallet_address(
+        wallet_address or _guess_wallet_address(client)
+    )
+    if not wallet:
+        print("[ERR] 无法确定钱包地址，终止盈利监控流程。")
+        return {
+            "profit_threshold": profit_ratio,
+            "iterations": [],
+            "resume_buy": False,
+            "wallet": wallet,
+        }
+
+    print(
+        f"[INIT] 盈利监控启动：wallet={wallet} threshold={profit_ratio * 100:.2f}%"
+    )
+
+    iteration = 0
+    summary: Dict[str, Any] = {
+        "profit_threshold": profit_ratio,
+        "iterations": [],
+        "resume_buy": False,
+        "wallet": wallet,
+    }
+
+    while True:
+        iteration += 1
+        _log_iteration_header(iteration, profit_ratio)
+
+        raw_positions = _fetch_positions(wallet)
+        snapshots = _collect_position_snapshots(raw_positions)
+
+        if not snapshots:
+            print("[RUN] 当前无持仓记录。")
+        profitable, claimables = _inspect_positions(
+            snapshots, profit_ratio=profit_ratio
+        )
+
+        iteration_result: Dict[str, Any] = {
+            "profitable": [snap.token_id for snap in profitable],
+            "claimables": [snap.token_id for snap in claimables],
+            "sells": [],
+        }
+
+        if profitable:
+            print(f"[RUN] 检测到 {len(profitable)} 个盈利仓位，开始卖出流程…")
+            sell_responses = _sell_positions(client, profitable)
+            iteration_result["sells"] = sell_responses
+        else:
+            print("[RUN] 暂无达到盈利阈值的仓位。")
+
+        if claimables:
+            _claim_positions(client, claimables)
+
+        summary["iterations"].append(iteration_result)
+
+        if iteration_result["sells"]:
+            balance = _get_available_balance(client)
+            if balance is None:
+                print(
+                    "[WARN] 卖出后无法获取余额，默认视为可继续买入。"
+                )
+                summary["resume_buy"] = True
+                break
+            if balance >= float(min_usdc_balance):
+                print(
+                    f"[DONE] 卖出完成且余额 {balance:.2f} USDC ≥ {min_usdc_balance}，可重新启动买入流程。"
+                )
+                summary["resume_buy"] = True
+                break
+            print(
+                f"[HINT] 卖出完成但余额 {balance:.2f} USDC 低于阈值 {min_usdc_balance}，继续监控。"
+            )
+
+        if max_cycles is not None and iteration >= max_cycles:
+            print(
+                f"[DONE] 达到最大轮次 {max_cycles}，结束盈利监控。"
+            )
+            break
+
+        print(
+            f"[RUN] 休眠 {check_interval} 秒后继续下一轮盈利监控…"
+        )
+        time.sleep(max(1.0, float(check_interval)))
+
+    return summary
