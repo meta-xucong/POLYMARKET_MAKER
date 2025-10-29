@@ -42,7 +42,9 @@ __all__ = [
     "init_client",
     "get_client",
     "verify_rest_capabilities",
+    "validate_rest_environment",
     "RestConnectivityError",
+    "RestConfigurationError",
 ]
 
 _CLIENT_SINGLETON = None  # 模块级单例
@@ -50,6 +52,40 @@ _CLIENT_SINGLETON = None  # 模块级单例
 
 class RestConnectivityError(RuntimeError):
     """REST 连接或基础功能校验失败时抛出的统一异常。"""
+
+
+class RestConfigurationError(RuntimeError):
+    """环境变量配置不符合预期时抛出的统一异常。"""
+
+
+def validate_rest_environment() -> Dict[str, str]:
+    """确保用于初始化 REST 客户端的关键环境变量存在且格式正确。"""
+    try:
+        raw_key = os.environ["POLY_KEY"].strip()
+    except KeyError as exc:
+        raise RestConfigurationError("未设置必需的环境变量 POLY_KEY") from exc
+
+    try:
+        raw_funder = os.environ["POLY_FUNDER"].strip()
+    except KeyError as exc:
+        raise RestConfigurationError("未设置必需的环境变量 POLY_FUNDER") from exc
+
+    if not raw_key:
+        raise RestConfigurationError("POLY_KEY 为空，请填写有效的私钥。")
+    normalized_key = _normalize_privkey(raw_key)
+    if len(normalized_key) != 64:
+        raise RestConfigurationError("POLY_KEY 长度异常，应为 32 字节（64 个 hex 字符）。")
+    try:
+        int(normalized_key, 16)
+    except ValueError as exc:
+        raise RestConfigurationError("POLY_KEY 不是合法的十六进制字符串。") from exc
+
+    if not raw_funder:
+        raise RestConfigurationError("POLY_FUNDER 为空，请填写有效的钱包地址。")
+    if not raw_funder.startswith("0x") or len(raw_funder) != 42:
+        raise RestConfigurationError("POLY_FUNDER 应为 0x 开头的 42 位地址。")
+
+    return {"key": raw_key, "normalized_key": normalized_key, "funder": raw_funder}
 
 
 def _normalize_privkey(k: str) -> str:
@@ -62,17 +98,9 @@ def init_client() -> ClobClient:
     chain_id = int(os.getenv("POLY_CHAIN_ID", str(DEFAULT_CHAIN_ID)))
     signature_type = int(os.getenv("POLY_SIGNATURE", str(DEFAULT_SIGNATURE_TYPE)))
 
-    try:
-        key = os.environ["POLY_KEY"]
-    except KeyError as exc:
-        raise RuntimeError("未设置必需的环境变量 POLY_KEY") from exc
-
-    try:
-        funder = os.environ["POLY_FUNDER"]
-    except KeyError as exc:
-        raise RuntimeError("未设置必需的环境变量 POLY_FUNDER") from exc
-
-    key = _normalize_privkey(key)
+    env = validate_rest_environment()
+    key = env["normalized_key"]
+    funder = env["funder"]
 
     client = ClobClient(
         host,
@@ -101,6 +129,12 @@ def verify_rest_capabilities(client: Optional[ClobClient] = None,
     """确认 REST Host 可达，且客户端具备买/卖所需的基础能力。"""
     if requests is None:
         raise RestConnectivityError("缺少 requests 依赖，无法执行 REST 连通性检测。请先安装 requests。")
+
+    env_snapshot = validate_rest_environment()
+    env_public = {
+        "key_hint": env_snapshot["normalized_key"][:6] + "..." + env_snapshot["normalized_key"][-4:],
+        "funder": env_snapshot["funder"],
+    }
 
     host = os.getenv("POLY_HOST", DEFAULT_HOST).rstrip("/")
     if not host.startswith("http://") and not host.startswith("https://"):
@@ -153,6 +187,7 @@ def verify_rest_capabilities(client: Optional[ClobClient] = None,
         "balance_method": balance_method,
         "price_method": price_method,
         "balance_snapshot": balance_snapshot,
+        "env": env_public,
     }
 
 
