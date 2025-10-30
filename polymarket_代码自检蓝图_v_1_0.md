@@ -7,7 +7,7 @@
 
 ## 变更摘要（相对旧蓝图）
 - **默认份数（留空）= 整股上取**：`ceil(1/ask)`（0 位小数），保证名义额 ≥ $1。
-- **BUY 精度“三件套”** 回归老版：**价 5dp 上取、份 4dp 上取、金额 2dp 上取**（金额仅用于校验/日志，不入单）。
+- **BUY 精度“三件套”** 回归老版：**价 2dp 上取、份 4dp 上取、金额 2dp 上取**（金额仅用于校验/日志，不入单）。
 - **执行链路回归老版**：主控不直接下单 → **统一调用执行器**
   - BUY → `Volatility_buy.execute_auto_buy(..., FAK)`
   - SELL → `Volatility_sell.execute_auto_sell(..., FOK 五档让利)`
@@ -35,7 +35,7 @@
 - BUY：
   - [ ] **默认份数**（留空）= `ceil(1/ask)` → **整股**（0 dp）。
   - [ ] 下单前规范化（由执行器完成）：
-    - 价格：**5 dp 上取**（不低于 `bestAsk`，利于 FAK 立即成交）。
+    - 价格：**2 dp 上取**（不低于 `bestAsk`，利于 FAK 立即成交）。
     - 份数：**4 dp 上取**（taker shares ≤ 4dp）。
     - 金额（USDC）：**2 dp 上取**（用于校验/日志）。
   - [ ] 名义额兜底：若 `price*size < 1`，执行器应以 `$1/price` 为基准重算（上取），保证 ≥ $1。
@@ -50,8 +50,8 @@
   - BUY 必须调用 `from Volatility_buy import execute_auto_buy`（FAK）。
   - SELL 必须调用 `from Volatility_sell import execute_auto_sell`（FOK 五档）。
 - [ ] `Volatility_buy.py`：
-  - 存在 `_q5_up`（价 5dp）、`_q4_up`（量 4dp）、`_q2_up`（金额 2dp）；
-  - `_min_legal_pair(...)` 使用 `max(s_hint, s_need)`（$1 覆盖），并做 5/4/2 量化；
+  - 存在 `_q4_up`（量 4dp）、`_q2_up`（价/金额 2dp）；
+  - `_min_legal_pair(...)` 使用 `max(s_hint, s_need)`（$1 覆盖），并做 2/4/2 量化；
   - `execute_auto_buy(...)` 打包 FAK 订单并提交。
 - [ ] `Volatility_sell.py`：
   - 存在 `_floor_2dp(...)`、`_ladder_prices(...)`（五档序列），`execute_auto_sell(...)` 构造 FOK 订单并依序尝试；
@@ -75,7 +75,7 @@
 ## 快速验收（烟囱）
 1. 同一市场与方向；份数留空；买入触发价略高于当前 `ask`；盈利百分比 = `1`；
 2. 期待：**FAK 买入**（成功）→ **达标** → **FOK 五档让利卖出**（成功）→ `[DONE]` 并退出；
-3. 若遭遇 400（极个别市场）：先复核 URL、tokenIds、份数是否整数（默认）与 BUY 走的是执行器；必要时可临时把 BUY 价量化降为 2dp 做保底重试（**可选建议，不纳入本基线**）。
+3. 若遭遇 400（极个别市场）：先复核 URL、tokenIds、份数是否整数（默认）与 BUY 走的是执行器；必要时可微调下单价与份数，确保仍满足 2/4/2 精度与 ≥$1 名义额的兜底逻辑（**可选建议，不纳入本基线**）。
 
 ---
 
@@ -83,7 +83,7 @@
 - [ ] `py_compile` 全部 OK。
 - [ ] `run.py` 同时存在 `def main()` 与 `__main__` 入口。
 - [ ] `run.py` **包含** `from Volatility_buy import execute_auto_buy` / `execute_auto_buy(` 调用。
-- [ ] `buy.py` **包含** `Decimal("0.00001") / Decimal("0.0001") / Decimal("0.01")`（5/4/2）。
+- [ ] `buy.py` **包含** `Decimal("0.0001") / Decimal("0.01")`（2/4/2）。
 - [ ] `sell.py` **包含** `_floor_2dp`、`_ladder_prices`、FOK 下单逻辑。
 - [ ] 日志关键字齐全：`[INIT]/[CHOICE]/[RUN]/[PX]/[HINT]/[TRADE]/[DONE]`。
 - [ ] 无重复 `def`、无明显残片（`log .`|`resp =`|`order =`|`tpg .`）。
@@ -91,5 +91,5 @@
 ---
 
 ## 维护说明
-- 本蓝图作为**长期基线**沿用；若未来服务端精度校验再收紧，可新增“**保底模式**”（BUY 价临时降为 2dp 的重试开关），但默认仍以老版 **5/4/2 + 整股** 为准。
+- 本蓝图作为**长期基线**沿用；若未来服务端精度校验再收紧，可新增“**保底模式**”（额外重试开关），但默认仍以老版 **2/4/2 + 整股** 为准。
 
