@@ -13,69 +13,26 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import requests
 
+from Volatility_config import FILTER_CONFIG, log_event
+
 # === 可配置参数（集中管理） ===
+_CFG = FILTER_CONFIG
 # 最低成交量阈值（严格大于该值）
-MINIMUM_VOLUME: float = 10_000.0
+MINIMUM_VOLUME: float = _CFG.minimum_volume
 # 市场最短剩余时间（用于排除即将到期的市场）
-MIN_TIME_TO_END: timedelta = timedelta(minutes=5)
+MIN_TIME_TO_END: timedelta = _CFG.min_time_to_end
 # 市场最远截止时间（含边界）
-MAX_TIME_TO_END: timedelta = timedelta(days=7)
+MAX_TIME_TO_END: timedelta = _CFG.max_time_to_end
 # YES 价格允许区间（开区间，排除边界值）
-MIN_YES_PRICE: float = 0.95
-MAX_YES_PRICE: float = 0.99
+MIN_YES_PRICE: float = _CFG.min_yes_price
+MAX_YES_PRICE: float = _CFG.max_yes_price
 # 关键词黑名单（匹配时区分大小写，沿用旧版默认值，可按需增删）
-BLACKLIST_KEYWORDS: Sequence[str] = (
-    "Bitcoin",
-    "BTC",
-    "ETH",
-    "Ethereum",
-    "Sol",
-    "Solana",
-    "Doge",
-    "Dogecoin",
-    "BNB",
-    "Binance",
-    "Cardano",
-    "ADA",
-    "XRP",
-    "Ripple",
-    "Matic",
-    "Polygon",
-    "Crypto",
-    "Cryptocurrency",
-    "Blockchain",
-    "Token",
-    "NFT",
-    "DeFi",
-    "vs",
-    "odds",
-    "score",
-    "spread",
-    "moneyline",
-    "Esports",
-    "CS2",
-    "Cup",
-    "Arsenal",
-    "Liverpool",
-    "Chelsea",
-    "EPL",
-    "PGA",
-    "Tour Championship",
-    "Scottie Scheffler",
-    "Vitality",
-    "MOUZ",
-    "Falcons",
-    "The MongolZ",
-    "AL",
-    "Houston",
-    "Chicago",
-    "New York",
-)
+BLACKLIST_KEYWORDS: Sequence[str] = _CFG.blacklist_keywords
 # API 请求配置
-POLYMARKET_API: str = "https://gamma-api.polymarket.com/markets"
-DEFAULT_WINDOW_DAYS: int = 3
-REQUEST_TIMEOUT: int = 10
-REQUEST_LIMIT: int = 500
+POLYMARKET_API: str = _CFG.polymarket_api
+DEFAULT_WINDOW_DAYS: int = _CFG.default_window_days
+REQUEST_TIMEOUT: int = _CFG.request_timeout
+REQUEST_LIMIT: int = _CFG.request_limit
 
 
 # === 工具函数 ===
@@ -276,11 +233,24 @@ def get_filtered_markets(*, now: datetime | None = None) -> List[Dict[str, Any]]
         if not market_is_eligible(market, now=now):
             continue
         eligible_markets.append(build_market_summary(market))
+    log_event(
+        "RUN",
+        "市场筛选完成。",
+        context={
+            "raw": len(raw_markets),
+            "eligible": len(eligible_markets),
+            "window": f"{DEFAULT_WINDOW_DAYS}d",
+        },
+    )
     return eligible_markets
 
 
 if __name__ == "__main__":
     markets = get_filtered_markets()
-    print(f"通过 Volatility_fliter 筛选：{len(markets)}")
+    log_event("RUN", "通过 Volatility_fliter 筛选。", context={"count": len(markets)})
     for item in markets[:5]:
-        print("-", item.get("question"), "→", item.get("url"))
+        log_event(
+            "HINT",
+            item.get("question", "(unknown)"),
+            context={"url": item.get("url")},
+        )

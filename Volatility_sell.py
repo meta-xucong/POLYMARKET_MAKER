@@ -35,6 +35,7 @@ from py_clob_client.order_builder.constants import SELL
 
 from Volatility_buy import execute_auto_buy
 from Volatility_fliter import get_filtered_markets
+from Volatility_config import TRADE_CONFIG, log_event
 
 __all__ = [
     "run_batch_buy",
@@ -305,7 +306,7 @@ def _fetch_positions(
         if isinstance(data, list):
             return data
     except Exception as exc:
-        print(f"[WARN] 获取持仓失败：{exc!r}")
+        log_event("WARN", "获取持仓失败。", context={"error": repr(exc)})
     return []
 
 
@@ -388,18 +389,34 @@ def _try_claim_position(client: ClobClient, token_id: str) -> Optional[Any]:
         for payload in ([token_id], token_id):
             try:
                 result = handler(payload)
-                print(f"[TRADE][CLAIM] token_id={token_id} method={name} payload={payload}")
+                log_event(
+                    "TRADE",
+                    "CLAIM 触发。",
+                    context={"token_id": token_id, "method": name, "payload": payload},
+                )
                 return result
             except TypeError:
                 continue
             except Exception as exc:  # pragma: no cover - 仅记录错误
                 last_exc = exc
-                print(f"[WARN] claim 方法 {name} 调用失败：{exc!r}")
+                log_event(
+                    "WARN",
+                    "claim 方法调用失败。",
+                    context={"token_id": token_id, "method": name, "error": repr(exc)},
+                )
                 break
     if last_exc is not None:
-        print(f"[WARN] 未能完成 token_id={token_id} 的 claim：{last_exc!r}")
+        log_event(
+            "WARN",
+            "未能完成 claim。",
+            context={"token_id": token_id, "error": repr(last_exc)},
+        )
     else:
-        print(f"[WARN] 当前 client 不支持自动 claim（token_id={token_id}）。")
+        log_event(
+            "WARN",
+            "当前 client 不支持自动 claim。",
+            context={"token_id": token_id},
+        )
     return None
 
 
@@ -407,9 +424,9 @@ def run_batch_buy(
     client: ClobClient,
     *,
     profit_threshold: Optional[float] = None,
-    default_profit_threshold: float = 0.05,
-    min_usdc_balance: float = 5.0,
-    interval_seconds: float = 20.0,
+    default_profit_threshold: float = TRADE_CONFIG.default_profit_percent / 100.0,
+    min_usdc_balance: float = TRADE_CONFIG.min_usdc_balance,
+    interval_seconds: float = TRADE_CONFIG.buy_interval_seconds,
     size_hint: float = 1.0,
 ) -> Dict[str, Any]:
     """执行批量买入流程并返回订单摘要。"""
@@ -417,43 +434,67 @@ def run_batch_buy(
     profit_ratio = _resolve_profit_threshold(
         profit_threshold, default_profit_threshold
     )
-    print(
-        f"[INIT] 批量买入启动，盈利阈值设定为 {profit_ratio * 100:.2f}% (ratio={profit_ratio:.4f})"
+    log_event(
+        "INIT",
+        "批量买入启动。",
+        context={
+            "profit_percent": f"{profit_ratio * 100:.2f}%",
+            "ratio": f"{profit_ratio:.4f}",
+        },
     )
 
-    print("[INIT] 调用 Volatility_fliter.get_filtered_markets() 获取候选市场…")
+    log_event("INIT", "调用 Volatility_fliter.get_filtered_markets() 获取候选市场…")
     markets = get_filtered_markets()
-    print(f"[INIT] 共获取 {len(markets)} 个候选市场。")
+    log_event("INIT", "获取候选市场完成。", context={"count": len(markets)})
 
     candidates: List[MarketCandidate] = []
     for market in markets:
         candidate = _resolve_candidate(market)
         if candidate is None:
-            print("[WARN] 跳过缺少 token_id 或报价的市场：", market.get("question"))
+            log_event(
+                "WARN",
+                "跳过缺少 token_id 或报价的市场。",
+                context={"question": market.get("question")},
+            )
             continue
         candidates.append(candidate)
 
     if not candidates:
-        print("[WARN] 没有可用于买入的市场，流程结束。")
+        log_event("WARN", "没有可用于买入的市场，流程结束。")
         return {"profit_threshold": profit_ratio, "orders": [], "markets": []}
 
     executed: List[BuyOrderResult] = []
 
     for index, candidate in enumerate(candidates, start=1):
-        print(
-            f"[RUN] 第 {index}/{len(candidates)} 个市场：{candidate.info.get('question', '(unknown)')}"
+        log_event(
+            "RUN",
+            f"第 {index}/{len(candidates)} 个市场。",
+            context={
+                "question": candidate.info.get("question", "(unknown)"),
+                "token_id": candidate.token_id,
+            },
         )
 
         while True:
             balance = _get_available_balance(client)
             if balance is None:
-                print("[WARN] 无法获取账户余额，默认继续执行买入。")
+                log_event("WARN", "无法获取账户余额，默认继续执行买入。")
                 break
             if balance >= min_usdc_balance:
-                print(f"[INIT] 可用余额 {balance:.2f} USDC，满足买入条件。")
+                log_event(
+                    "INIT",
+                    "可用余额满足买入条件。",
+                    context={"balance": round(balance, 2)},
+                )
                 break
-            print(
-                f"[HINT] 可用余额 {balance:.2f} USDC 低于阈值 {min_usdc_balance}，暂停 {interval_seconds} 秒后重试。"
+            log_event(
+                "HINT",
+                "可用余额低于阈值，暂停后重试。",
+                context={
+                    "balance": round(balance, 2),
+                    "threshold": min_usdc_balance,
+                    "interval": interval_seconds,
+                },
             )
             time.sleep(max(1.0, float(interval_seconds)))
 
@@ -466,11 +507,22 @@ def run_batch_buy(
             response = execute_auto_buy(client, candidate.token_id, price, size)
             status = str((response or {}).get("status", "")).lower()
             success = status in {"success", "matched"}
-            print(
-                f"[TRADE][BUY] token_id={candidate.token_id} price={price} size_hint={size} status={status}"
+            log_event(
+                "TRADE",
+                "BUY 请求完成。",
+                context={
+                    "token_id": candidate.token_id,
+                    "price": price,
+                    "size_hint": size,
+                    "status": status,
+                },
             )
         except Exception as exc:
-            print(f"[ERR] 买入失败：token_id={candidate.token_id} error={exc!r}")
+            log_event(
+                "ERR",
+                "买入失败。",
+                context={"token_id": candidate.token_id, "error": repr(exc)},
+            )
 
         executed.append(
             BuyOrderResult(
@@ -485,12 +537,14 @@ def run_batch_buy(
         )
 
         if index < len(candidates):
-            print(
-                f"[RUN] 等待 {interval_seconds} 秒后尝试下一个市场…"
+            log_event(
+                "RUN",
+                "等待后尝试下一个市场…",
+                context={"interval": interval_seconds},
             )
             time.sleep(max(0.0, float(interval_seconds)))
 
-    print("[DONE] 批量买入流程结束。")
+    log_event("DONE", "批量买入流程结束。", context={"orders": len(executed)})
     return {
         "profit_threshold": profit_ratio,
         "orders": [item.to_dict() for item in executed],
@@ -530,7 +584,11 @@ def execute_auto_sell(
     # 数量按 2dp 向下取整
     size_real = _floor_2dp(size)
     if size_real < 0.01:
-        print("[Volatility_sell] size < 0.01 after 2dp floor, skip.")
+        log_event(
+            "HINT",
+            "卖出数量低于最小单位，跳过。",
+            context={"token_id": token_id, "size": size_real},
+        )
         return None
 
     # 生成最多 attempts 次的价格阶梯（按 4dp round）
@@ -543,7 +601,17 @@ def execute_auto_sell(
     last_resp: Optional[Dict[str, Any]] = None
 
     for idx, px in enumerate(prices, start=1):
-        print(f"[Volatility_sell] Attempt {idx}/{len(prices)} - price={px} size={size_real} (ref={price})")
+        log_event(
+            "TRADE",
+            "SELL 尝试。",
+            context={
+                "token_id": token_id,
+                "attempt": f"{idx}/{len(prices)}",
+                "price": px,
+                "size": size_real,
+                "ref_price": price,
+            },
+        )
         try:
             order_args = OrderArgs(price=float(px), size=float(size_real), side=SELL, token_id=str(token_id))
             signed = client.create_order(order_args)
@@ -551,13 +619,21 @@ def execute_auto_sell(
             last_resp = resp
 
             status = (resp or {}).get("status", "").lower()
-            print(f"[Volatility_sell] resp.status={status}")
+            log_event(
+                "TRADE",
+                "SELL 响应。",
+                context={"token_id": token_id, "status": status, "price": px},
+            )
             if status in {"success", "matched"}:
                 return resp
         except Exception as e:
-            print(f"[Volatility_sell] Order error: {e!r}")
+            log_event(
+                "ERR",
+                "SELL 下单失败。",
+                context={"token_id": token_id, "error": repr(e)},
+            )
 
-    print("[Volatility_sell] All attempts failed.")
+    log_event("WARN", "SELL 尝试全部失败。", context={"token_id": token_id})
     return last_resp
 
 
@@ -576,8 +652,14 @@ def _format_market_label(market: Dict[str, Any]) -> str:
 
 def _log_iteration_header(iteration: int, ratio: float) -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(
-        f"[RUN] 盈利监控轮次 {iteration} @ {now} (threshold={ratio * 100:.2f}%)"
+    log_event(
+        "RUN",
+        "盈利监控轮次。",
+        context={
+            "iteration": iteration,
+            "timestamp": now,
+            "threshold": f"{ratio * 100:.2f}%",
+        },
     )
 
 
@@ -590,8 +672,16 @@ def _inspect_positions(
     claimables: List[PositionSnapshot] = []
     for snap in entries:
         label = _format_market_label(snap.market)
-        print(
-            f"[PX] token_id={snap.token_id} size={snap.size_real:.4f} avg={snap.average_price} pnl={snap.pnl_percent:.2f}% -> {label}"
+        log_event(
+            "PX",
+            "持仓快照。",
+            context={
+                "token_id": snap.token_id,
+                "size": f"{snap.size_real:.4f}",
+                "avg": snap.average_price,
+                "pnl_percent": f"{snap.pnl_percent:.2f}%",
+                "label": label,
+            },
         )
         if snap.is_profitable(profit_ratio):
             profitable.append(snap)
@@ -608,8 +698,10 @@ def _sell_positions(
     for snap in positions:
         best_bid = _fetch_best_bid(client, snap.token_id)
         if best_bid is None:
-            print(
-                f"[WARN] 无法获取 token_id={snap.token_id} 的买一价，跳过卖出。"
+            log_event(
+                "WARN",
+                "无法获取买一价，跳过卖出。",
+                context={"token_id": snap.token_id},
             )
             continue
         try:
@@ -617,16 +709,24 @@ def _sell_positions(
             if resp is not None:
                 responses.append(resp)
         except Exception as exc:
-            print(
-                f"[ERR] 卖出失败 token_id={snap.token_id} bid={best_bid}: {exc!r}"
+            log_event(
+                "ERR",
+                "卖出失败。",
+                context={
+                    "token_id": snap.token_id,
+                    "bid": best_bid,
+                    "error": repr(exc),
+                },
             )
     return responses
 
 
 def _claim_positions(client: ClobClient, claimables: List[PositionSnapshot]) -> None:
     for snap in claimables:
-        print(
-            f"[HINT] token_id={snap.token_id} 市场已到期，尝试自动 claim。"
+        log_event(
+            "HINT",
+            "市场已到期，尝试自动 claim。",
+            context={"token_id": snap.token_id},
         )
         _try_claim_position(client, snap.token_id)
 
@@ -635,9 +735,9 @@ def monitor_profit_and_sell(
     client: ClobClient,
     *,
     profit_threshold: Optional[float] = None,
-    default_profit_threshold: float = 0.05,
-    check_interval: float = 600.0,
-    min_usdc_balance: float = 5.0,
+    default_profit_threshold: float = TRADE_CONFIG.default_profit_percent / 100.0,
+    check_interval: float = TRADE_CONFIG.check_interval_seconds,
+    min_usdc_balance: float = TRADE_CONFIG.min_usdc_balance,
     wallet_address: Optional[str] = None,
     max_cycles: Optional[int] = None,
 ) -> Dict[str, Any]:
@@ -650,7 +750,7 @@ def monitor_profit_and_sell(
         wallet_address or _guess_wallet_address(client)
     )
     if not wallet:
-        print("[ERR] 无法确定钱包地址，终止盈利监控流程。")
+        log_event("ERR", "无法确定钱包地址，终止盈利监控流程。")
         return {
             "profit_threshold": profit_ratio,
             "iterations": [],
@@ -658,8 +758,13 @@ def monitor_profit_and_sell(
             "wallet": wallet,
         }
 
-    print(
-        f"[INIT] 盈利监控启动：wallet={wallet} threshold={profit_ratio * 100:.2f}%"
+    log_event(
+        "INIT",
+        "盈利监控启动。",
+        context={
+            "wallet": wallet,
+            "threshold": f"{profit_ratio * 100:.2f}%",
+        },
     )
 
     iteration = 0
@@ -678,7 +783,7 @@ def monitor_profit_and_sell(
         snapshots = _collect_position_snapshots(raw_positions)
 
         if not snapshots:
-            print("[RUN] 当前无持仓记录。")
+            log_event("RUN", "当前无持仓记录。")
         profitable, claimables = _inspect_positions(
             snapshots, profit_ratio=profit_ratio
         )
@@ -690,11 +795,15 @@ def monitor_profit_and_sell(
         }
 
         if profitable:
-            print(f"[RUN] 检测到 {len(profitable)} 个盈利仓位，开始卖出流程…")
+            log_event(
+                "RUN",
+                "检测到盈利仓位，开始卖出流程…",
+                context={"count": len(profitable)},
+            )
             sell_responses = _sell_positions(client, profitable)
             iteration_result["sells"] = sell_responses
         else:
-            print("[RUN] 暂无达到盈利阈值的仓位。")
+            log_event("RUN", "暂无达到盈利阈值的仓位。")
 
         if claimables:
             _claim_positions(client, claimables)
@@ -704,29 +813,38 @@ def monitor_profit_and_sell(
         if iteration_result["sells"]:
             balance = _get_available_balance(client)
             if balance is None:
-                print(
-                    "[WARN] 卖出后无法获取余额，默认视为可继续买入。"
+                log_event(
+                    "WARN",
+                    "卖出后无法获取余额，默认视为可继续买入。",
                 )
                 summary["resume_buy"] = True
                 break
             if balance >= float(min_usdc_balance):
-                print(
-                    f"[DONE] 卖出完成且余额 {balance:.2f} USDC ≥ {min_usdc_balance}，可重新启动买入流程。"
+                log_event(
+                    "DONE",
+                    "卖出完成且余额满足阈值，可重新启动买入流程。",
+                    context={"balance": round(balance, 2), "threshold": min_usdc_balance},
                 )
                 summary["resume_buy"] = True
                 break
-            print(
-                f"[HINT] 卖出完成但余额 {balance:.2f} USDC 低于阈值 {min_usdc_balance}，继续监控。"
+            log_event(
+                "HINT",
+                "卖出完成但余额低于阈值，继续监控。",
+                context={"balance": round(balance, 2), "threshold": min_usdc_balance},
             )
 
         if max_cycles is not None and iteration >= max_cycles:
-            print(
-                f"[DONE] 达到最大轮次 {max_cycles}，结束盈利监控。"
+            log_event(
+                "DONE",
+                "达到最大轮次，结束盈利监控。",
+                context={"max_cycles": max_cycles},
             )
             break
 
-        print(
-            f"[RUN] 休眠 {check_interval} 秒后继续下一轮盈利监控…"
+        log_event(
+            "RUN",
+            "休眠后继续下一轮盈利监控…",
+            context={"interval": check_interval},
         )
         time.sleep(max(1.0, float(check_interval)))
 
