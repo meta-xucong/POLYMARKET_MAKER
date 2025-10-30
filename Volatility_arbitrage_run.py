@@ -30,12 +30,17 @@ from Volatility_arbitrage_main_ws import (
     WsConnectivityError,
 )
 from Volatility_sell import run_batch_buy, monitor_profit_and_sell
+from Volatility_config import (
+    TRADE_CONFIG,
+    config_snapshot,
+    log_event,
+)
 
 # === 默认配置 ===
-DEFAULT_PROFIT_PERCENT = 5.0        # 盈利阈值（百分比）
-DEFAULT_MIN_USDC_BALANCE = 5.0      # 最小可用余额阈值（USDC）
-DEFAULT_BUY_INTERVAL = 20.0         # 批量买入节奏（秒）
-DEFAULT_CHECK_INTERVAL = 600.0      # 盈利监控间隔（秒）
+DEFAULT_PROFIT_PERCENT = TRADE_CONFIG.default_profit_percent        # 盈利阈值（百分比）
+DEFAULT_MIN_USDC_BALANCE = TRADE_CONFIG.min_usdc_balance            # 最小可用余额阈值（USDC）
+DEFAULT_BUY_INTERVAL = TRADE_CONFIG.buy_interval_seconds           # 批量买入节奏（秒）
+DEFAULT_CHECK_INTERVAL = TRADE_CONFIG.check_interval_seconds       # 盈利监控间隔（秒）
 
 
 # === 辅助函数 ===
@@ -51,10 +56,10 @@ def _prompt_float(prompt: str, default: float, *, min_value: Optional[float] = N
             try:
                 value = float(raw)
             except ValueError:
-                print("[WARN] 输入非法，请重新输入数字。")
+                log_event("WARN", "输入非法，请重新输入数字。")
                 continue
         if min_value is not None and value < min_value:
-            print(f"[WARN] 数值需 ≥ {min_value}，请重新输入。")
+            log_event("WARN", f"数值需 ≥ {min_value}，请重新输入。")
             continue
         return float(value)
 
@@ -90,42 +95,51 @@ def _format_orders_summary(summary: Dict[str, Any]) -> str:
 
 
 def main() -> None:
-    print("[INIT] Polymarket 套利程序启动。")
+    defaults = config_snapshot()["trade"]
+    log_event("INIT", "Polymarket 套利程序启动。", context=defaults)
 
     # --- REST 连通性检查 ---
     try:
         rest_snapshot = verify_rest_capabilities()
     except RestConfigurationError as exc:
-        print(f"[ERR] REST 配置错误：{exc}")
+        log_event("ERR", f"REST 配置错误：{exc}")
         return
     except RestConnectivityError as exc:
-        print(f"[ERR] REST 连通性检查失败：{exc}")
+        log_event("ERR", f"REST 连通性检查失败：{exc}")
         return
     else:
-        print(f"[INIT] REST 连通性通过：{_format_rest_snapshot(rest_snapshot)}")
+        log_event(
+            "INIT",
+            "REST 连通性通过。",
+            context={"summary": _format_rest_snapshot(rest_snapshot)},
+        )
 
     # --- WS 连通性检查 ---
     try:
         ws_snapshot = verify_ws_connection()
     except WsConnectivityError as exc:
-        print(f"[ERR] WS 连通性检查失败：{exc}")
+        log_event("ERR", f"WS 连通性检查失败：{exc}")
         return
     else:
-        print(
-            "[INIT] WS 连通性通过："
-            f"url={ws_snapshot.get('url')} attempts={ws_snapshot.get('attempts')}"
+        log_event(
+            "INIT",
+            "WS 连通性通过。",
+            context={
+                "url": ws_snapshot.get("url"),
+                "attempts": ws_snapshot.get("attempts"),
+            },
         )
 
     # --- 初始化客户端 ---
     try:
         client = get_client()
     except RestConfigurationError as exc:
-        print(f"[ERR] 初始化 REST 客户端失败：{exc}")
+        log_event("ERR", f"初始化 REST 客户端失败：{exc}")
         return
     except Exception as exc:  # pragma: no cover - 防御性兜底
-        print(f"[ERR] 初始化 REST 客户端出现异常：{exc}")
+        log_event("ERR", f"初始化 REST 客户端出现异常：{exc}")
         return
-    print("[INIT] ClobClient 就绪，可执行买卖。")
+    log_event("INIT", "ClobClient 就绪，可执行买卖。")
 
     # --- 交互式配置 ---
     profit_ratio = _prompt_profit_ratio(DEFAULT_PROFIT_PERCENT)
@@ -145,16 +159,21 @@ def main() -> None:
         min_value=30.0,
     )
 
-    print(
-        "[CHOICE] 配置摘要："
-        f"profit={profit_ratio * 100:.2f}% min_balance={min_balance}USDC "
-        f"buy_interval={buy_interval}s check_interval={check_interval}s"
+    log_event(
+        "CHOICE",
+        "配置摘要。",
+        context={
+            "profit_percent": f"{profit_ratio * 100:.2f}%",
+            "min_balance": f"{min_balance}USDC",
+            "buy_interval": f"{buy_interval}s",
+            "check_interval": f"{check_interval}s",
+        },
     )
 
     cycle = 0
     while True:
         cycle += 1
-        print(f"[RUN] ===== 周期 {cycle}：批量买入阶段 =====")
+        log_event("RUN", f"===== 周期 {cycle}：批量买入阶段 =====")
         buy_summary = run_batch_buy(
             client,
             profit_threshold=profit_ratio,
@@ -162,9 +181,9 @@ def main() -> None:
             min_usdc_balance=min_balance,
             interval_seconds=buy_interval,
         )
-        print(f"[RUN] 批量买入完成：{_format_orders_summary(buy_summary)}")
+        log_event("RUN", f"批量买入完成：{_format_orders_summary(buy_summary)}")
 
-        print(f"[RUN] ===== 周期 {cycle}：盈利监控阶段 =====")
+        log_event("RUN", f"===== 周期 {cycle}：盈利监控阶段 =====")
         monitor_summary = monitor_profit_and_sell(
             client,
             profit_threshold=profit_ratio,
@@ -173,10 +192,10 @@ def main() -> None:
             min_usdc_balance=min_balance,
         )
         iterations = monitor_summary.get("iterations") or []
-        print(f"[RUN] 盈利监控结束，本轮共执行 {len(iterations)} 次检查。")
+        log_event("RUN", f"盈利监控结束，本轮共执行 {len(iterations)} 次检查。")
 
         if not monitor_summary.get("resume_buy"):
-            print("[DONE] 盈利监控未建议继续买入，程序结束。")
+            log_event("DONE", "盈利监控未建议继续买入，程序结束。")
             break
 
         try:
@@ -184,10 +203,10 @@ def main() -> None:
         except EOFError:
             cont = "y"
         if cont and cont.startswith("n"):
-            print("[DONE] 用户选择终止，程序结束。")
+            log_event("DONE", "用户选择终止，程序结束。")
             break
 
-        print("[RUN] 准备进入下一轮……")
+        log_event("RUN", "准备进入下一轮……")
 
 
 if __name__ == "__main__":
