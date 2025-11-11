@@ -63,6 +63,7 @@ except Exception as e:
 
 CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = "https://gamma-api.polymarket.com"
+API_MIN_ORDER_SIZE = 5.0
 
 # ===== 旧版解析器（复刻 + 极小修正） =====
 def _parse_yes_no_ids_literal(source: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1309,6 +1310,7 @@ def main():
                         target_size=order_size,
                         poll_sec=10.0,
                         min_quote_amt=1.0,
+                        min_order_size=API_MIN_ORDER_SIZE,
                         best_bid_fn=_latest_best_bid,
                         stop_check=stop_event.is_set,
                     )
@@ -1355,6 +1357,7 @@ def main():
                         position_size=position_size,
                         floor_X=float(floor_price),
                         poll_sec=10.0,
+                        min_order_size=API_MIN_ORDER_SIZE,
                         best_ask_fn=_latest_best_ask,
                         stop_check=stop_event.is_set,
                     )
@@ -1369,14 +1372,20 @@ def main():
                 sell_status = str(sell_resp.get("status") or "").upper()
                 sell_filled = float(sell_resp.get("filled") or 0.0)
                 sell_avg = sell_resp.get("avg_price")
+                eps = 1e-4
                 sell_remaining = float(sell_resp.get("remaining") or 0.0)
+                dust_threshold = API_MIN_ORDER_SIZE if API_MIN_ORDER_SIZE and API_MIN_ORDER_SIZE > 0 else None
+                treat_as_dust = False
+                if dust_threshold is not None and sell_remaining > eps:
+                    if sell_remaining < dust_threshold - 1e-9:
+                        treat_as_dust = True
+                remaining_for_strategy = None if treat_as_dust else sell_remaining
                 strategy.on_sell_filled(
                     avg_price=sell_avg if sell_filled > 0 else None,
                     size=sell_filled if sell_filled > 0 else None,
-                    remaining=sell_remaining,
+                    remaining=remaining_for_strategy,
                 )
-                eps = 1e-4
-                if sell_remaining > eps:
+                if sell_remaining > eps and not treat_as_dust:
                     position_size = sell_remaining
                     last_order_size = sell_remaining
                     display_price = sell_avg if sell_avg is not None else floor_price
@@ -1391,9 +1400,14 @@ def main():
                     buy_cooldown_reason = "sell"
                     sold_display = sell_filled if sell_filled > 0 else filled_amt
                     display_price = sell_avg if sell_avg is not None else floor_price
+                    dust_note = ""
+                    if treat_as_dust and sell_remaining > eps and dust_threshold is not None:
+                        dust_note = (
+                            f" (剩余 {sell_remaining:.4f} < 最小挂单量 {dust_threshold:.2f}，视为完成)"
+                        )
                     print(
                         "[STATE] 卖出成交 -> "
-                        f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}"
+                        f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
                     )
 
             elif action.action == ActionType.SELL:
