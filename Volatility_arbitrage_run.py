@@ -1249,13 +1249,6 @@ def main():
                 )
                 extra_lines.append(price_line)
 
-                if st.get("state") == "LONG":
-                    sell_target = st.get("sell_trigger")
-                    if sell_target is not None:
-                        extra_lines.append(f"    目标卖出价格: {float(sell_target):.4f}")
-                    else:
-                        extra_lines.append("    目标卖出价格: -")
-
                 if st.get("sell_only"):
                     extra_lines.append("    状态：倒计时仅卖出模式（禁止买入）")
                 for line in extra_lines:
@@ -1379,8 +1372,7 @@ def main():
                 )
             except Exception as exc:
                 print(f"[ERR] 卖出挂单异常：{exc}")
-                strategy.on_reject(str(exc))
-                continue
+                raise
 
             print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
             sell_status = str(sell_resp.get("status") or "").upper()
