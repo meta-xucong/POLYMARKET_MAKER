@@ -1153,25 +1153,6 @@ def main():
 
     threading.Thread(target=_input_listener, daemon=True).start()
 
-    def _fmt_price(val: Optional[Any]) -> str:
-        try:
-            return f"{float(val):.4f}"
-        except (TypeError, ValueError):
-            return "-"
-
-    def _fmt_pct(val: Optional[Any]) -> str:
-        try:
-            return f"{float(val) * 100.0:.2f}%"
-        except (TypeError, ValueError):
-            return "-"
-
-    def _fmt_minutes(seconds: Optional[Any]) -> str:
-        try:
-            sec = float(seconds)
-        except (TypeError, ValueError):
-            return "-"
-        return f"{sec / 60.0:.1f}m"
-
     def _latest_best_bid() -> Optional[float]:
         snap = latest.get(token_id) or {}
         try:
@@ -1190,7 +1171,6 @@ def main():
 
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
-    last_log = 0.0
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
