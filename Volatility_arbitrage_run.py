@@ -1173,7 +1173,6 @@ def main():
     last_order_size: Optional[float] = None
     last_log = 0.0
     buy_cooldown_until: float = 0.0
-    buy_cooldown_reason: Optional[str] = None
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
     selling_in_progress = False
@@ -1186,13 +1185,10 @@ def main():
                     print("[COUNTDOWN] 仍在仅卖出模式内，丢弃待执行的买入信号。")
                     strategy.on_reject("sell-only window active")
                     pending_buy = None
-                    buy_cooldown_reason = None
                 else:
-                    label = "卖出" if buy_cooldown_reason == "sell" else "买入"
-                    print(f"[COOLDOWN] {label}冷却结束，重新尝试买入…")
+                    print("[COOLDOWN] 冷却结束，重新尝试买入…")
                     action_queue.put(pending_buy)
                     pending_buy = None
-                    buy_cooldown_reason = None
 
             if now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
@@ -1279,14 +1275,9 @@ def main():
                 now_for_buy = time.time()
                 if now_for_buy < buy_cooldown_until:
                     remaining = buy_cooldown_until - now_for_buy
-                    if buy_cooldown_reason == "sell":
-                        print(
-                            f"[COOLDOWN] 最近一次卖出后尚在冷却中，剩余 {remaining:.1f}s 再尝试买入。"
-                        )
-                    else:
-                        print(
-                            f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
-                        )
+                    print(
+                        f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
+                    )
                     pending_buy = action
                     continue
 
@@ -1318,7 +1309,6 @@ def main():
                     print(f"[ERR] 买入下单异常：{exc}")
                     strategy.on_reject(str(exc))
                     buy_cooldown_until = time.time() + short_buy_cooldown
-                    buy_cooldown_reason = "buy"
                     continue
                 print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
                 buy_status = str(buy_resp.get("status") or "").upper()
@@ -1342,7 +1332,6 @@ def main():
                     print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
                     strategy.on_reject(reason_text)
                 buy_cooldown_until = time.time() + short_buy_cooldown
-                buy_cooldown_reason = "buy"
 
                 if filled_amt <= 0:
                     continue
@@ -1401,8 +1390,6 @@ def main():
                 else:
                     position_size = None
                     last_order_size = None
-                    buy_cooldown_until = time.time() + 15.0
-                    buy_cooldown_reason = "sell"
                     sold_display = sell_filled if sell_filled > 0 else filled_amt
                     display_price = sell_avg if sell_avg is not None else floor_price
                     dust_note = ""
