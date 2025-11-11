@@ -740,46 +740,6 @@ def main():
         print("[ERR] 未能获取市场结束时间，程序终止。")
         return
 
-    sell_only_start_ts: Optional[float] = None
-    if market_deadline_ts:
-        print(
-            "请输入倒计时开始时间（UTC）。"
-            "可输入：\n"
-            "  - 绝对时间，如 2024-01-01 12:30:00 或 ISO8601；\n"
-            "  - 提前的分钟数，如输入 30 表示截止前 30 分钟进入仅卖出模式；\n"
-            "留空表示不启用倒计时卖出保护。"
-        )
-        countdown_in = input().strip()
-        if countdown_in:
-            parsed_ts: Optional[float] = None
-            used_minutes = False
-            if re.search(r"[A-Za-z:/-]", countdown_in):
-                parsed_ts = _parse_timestamp(countdown_in)
-            else:
-                try:
-                    minutes_before = float(countdown_in)
-                    parsed_ts = market_deadline_ts - minutes_before * 60.0
-                    used_minutes = True
-                except Exception:
-                    parsed_ts = _parse_timestamp(countdown_in)
-            if not parsed_ts:
-                print("[ERR] 无法解析倒计时开始时间，程序终止。")
-                return
-            if parsed_ts >= market_deadline_ts:
-                print("[ERR] 倒计时开始时间必须早于市场结束时间，程序终止。")
-                return
-            sell_only_start_ts = parsed_ts
-            if used_minutes:
-                print(
-                    f"[INFO] 倒计时卖出模式将在市场结束前 {countdown_in} 分钟开启。"
-                )
-            else:
-                dt_start = datetime.fromtimestamp(parsed_ts, tz=timezone.utc)
-                print(
-                    "[INFO] 倒计时卖出模式将在 UTC 时间 "
-                    f"{dt_start.isoformat()} 开启。"
-                )
-
     print('请选择方向（YES/NO），回车确认：')
     side = input().strip().upper()
     if side not in ("YES", "NO"):
