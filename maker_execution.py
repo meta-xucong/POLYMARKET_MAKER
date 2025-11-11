@@ -610,7 +610,8 @@ def maker_sell_follow_ask_with_floor_wait(
                     keyword in msg for keyword in ("insufficient", "balance", "position")
                 )
                 if insufficient:
-                    shrink_qty = _floor_to_dp(max(qty - tick, 0.0), SELL_SIZE_DP)
+                    current_remaining = max(goal_size - filled_total, 0.0)
+                    shrink_qty = _floor_to_dp(max(current_remaining - tick, 0.0), SELL_SIZE_DP)
                     if shrink_qty >= 0.01 and (
                         not api_min_qty or shrink_qty + _MIN_FILL_EPS >= api_min_qty
                     ):
@@ -618,13 +619,13 @@ def maker_sell_follow_ask_with_floor_wait(
                             "[MAKER][SELL] 可用仓位不足，调整卖出数量后重试 -> "
                             f"old={qty:.{SELL_SIZE_DP}f} new={shrink_qty:.{SELL_SIZE_DP}f}"
                         )
-                        goal_size = shrink_qty
-                        remaining = shrink_qty
+                        goal_size = filled_total + shrink_qty
+                        remaining = max(goal_size - filled_total, 0.0)
                         continue
                     final_status = (
                         "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
                     )
-                    remaining = max(qty - filled_total, 0.0)
+                    remaining = max(goal_size - filled_total, 0.0)
                     print(
                         "[MAKER][SELL] 可用仓位低于最小挂单量，放弃后续卖出尝试。"
                     )

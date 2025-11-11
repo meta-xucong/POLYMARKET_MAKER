@@ -1171,6 +1171,12 @@ def main():
 
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
+    status_snapshot = strategy.status()
+    initial_pos = _extract_position_size(status_snapshot)
+    if initial_pos > 0:
+        position_size = initial_pos
+        last_order_size = initial_pos
+    last_log: Optional[float] = None
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
@@ -1188,7 +1194,7 @@ def main():
                     action_queue.put(pending_buy)
                     pending_buy = None
 
-            if now - last_log >= 1.0:
+            if last_log is None or now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
                 bid = float(snap.get("best_bid") or 0.0)
                 ask = float(snap.get("best_ask") or 0.0)
