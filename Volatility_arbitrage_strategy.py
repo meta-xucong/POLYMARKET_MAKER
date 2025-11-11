@@ -40,6 +40,9 @@ class StrategyConfig:
     # 轻量防抖：同一方向的“待确认”状态下不重复发信号
     disable_duplicate_signal: bool = True
 
+    # maker 模式下可禁用 SELL 信号，由上游自行处理退出
+    disable_sell_signals: bool = False
+
     # 可选价域守门（避免极端边界价误触）
     min_price: Optional[float] = 0.0
     max_price: Optional[float] = 1.0
@@ -206,6 +209,9 @@ class VolArbStrategy:
         return act
 
     def _maybe_sell(self, best_bid: float, ts: Optional[float]) -> Optional[Action]:
+        if getattr(self.cfg, "disable_sell_signals", False):
+            return None
+
         if self._entry_price is None:
             return None  # 防守式检查
 

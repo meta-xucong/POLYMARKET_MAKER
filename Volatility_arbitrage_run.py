@@ -849,6 +849,7 @@ def main():
         drop_window_minutes=drop_window,
         drop_pct=drop_pct,
         profit_pct=profit_pct,
+        disable_sell_signals=True,
     )
     strategy = VolArbStrategy(cfg)
     strategy_supports_total_position = _strategy_accepts_total_position(strategy)
@@ -995,7 +996,7 @@ def main():
         )
 
     def _on_event(ev: Dict[str, Any]):
-        nonlocal market_closed_detected, selling_in_progress
+        nonlocal market_closed_detected
         if stop_event.is_set():
             return
         if not isinstance(ev, dict):
@@ -1020,9 +1021,7 @@ def main():
             bid, ask, last = _parse_price_change(pc)
             latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask}
             action = strategy.on_tick(best_ask=ask, best_bid=bid, ts=ts)
-            if action:
-                if action.action == ActionType.SELL and selling_in_progress:
-                    continue
+            if action and action.action == ActionType.BUY:
                 action_queue.put(action)
             if _is_market_closed(pc):
                 print("[MARKET] 检测到市场关闭信号，准备退出…")
@@ -1195,7 +1194,6 @@ def main():
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
-    selling_in_progress = False
 
     try:
         while not stop_event.is_set():
@@ -1287,145 +1285,142 @@ def main():
                 stop_event.set()
                 continue
 
-            if action.action == ActionType.BUY:
-                if sell_only_event.is_set():
-                    print("[COUNTDOWN] 当前处于倒计时仅卖出模式，忽略买入信号。")
-                    strategy.on_reject("sell-only window active")
-                    continue
-                now_for_buy = time.time()
-                if now_for_buy < buy_cooldown_until:
-                    remaining = buy_cooldown_until - now_for_buy
-                    print(
-                        f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
-                    )
-                    pending_buy = action
-                    continue
+            if action.action != ActionType.BUY:
+                print(f"[WARN] 收到未预期的动作 {action.action}，已忽略。")
+                continue
 
-                ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
-                if size_in:
-                    try:
-                        order_size = float(size_in)
-                    except Exception:
-                        print("[ERR] 份数非法，终止。")
-                        strategy.stop("invalid size")
-                        stop_event.set()
-                        break
-                else:
-                    order_size = _calc_size_by_1dollar(ref_price)
-                    print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
-
-                try:
-                    buy_resp = maker_buy_follow_bid(
-                        client=client,
-                        token_id=token_id,
-                        target_size=order_size,
-                        poll_sec=10.0,
-                        min_quote_amt=1.0,
-                        min_order_size=API_MIN_ORDER_SIZE,
-                        best_bid_fn=_latest_best_bid,
-                        stop_check=stop_event.is_set,
-                    )
-                except Exception as exc:
-                    print(f"[ERR] 买入下单异常：{exc}")
-                    strategy.on_reject(str(exc))
-                    buy_cooldown_until = time.time() + short_buy_cooldown
-                    continue
-                print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
-                buy_status = str(buy_resp.get("status") or "").upper()
-                filled_amt = float(buy_resp.get("filled") or 0.0)
-                avg_price = buy_resp.get("avg_price")
-                if filled_amt > 0:
-                    fill_px = float(avg_price if avg_price is not None else ref_price)
-                    prior_position = position_size or 0.0
-                    position_size = prior_position + filled_amt
-                    last_order_size = filled_amt
-                    buy_filled_kwargs = {
-                        "avg_price": fill_px,
-                        "size": filled_amt,
-                    }
-                    if strategy_supports_total_position:
-                        buy_filled_kwargs["total_position"] = position_size
-                    strategy.on_buy_filled(**buy_filled_kwargs)
-                    print(
-                        f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
-                    )
-                else:
-                    reason_text = str(buy_resp)
-                    print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
-                    strategy.on_reject(reason_text)
-                buy_cooldown_until = time.time() + short_buy_cooldown
-
-                if filled_amt <= 0:
-                    continue
-
-                floor_price = strategy.sell_trigger_price()
-                if floor_price is None:
-                    print("[WARN] 无法计算卖出地板价，跳过卖出流程。")
-                    strategy.on_reject("missing sell trigger")
-                    continue
-
-                selling_in_progress = True
-                sell_resp: Dict[str, Any]
-                try:
-                    sell_resp = maker_sell_follow_ask_with_floor_wait(
-                        client=client,
-                        token_id=token_id,
-                        position_size=position_size,
-                        floor_X=float(floor_price),
-                        poll_sec=10.0,
-                        min_order_size=API_MIN_ORDER_SIZE,
-                        best_ask_fn=_latest_best_ask,
-                        stop_check=stop_event.is_set,
-                    )
-                except Exception as exc:
-                    print(f"[ERR] 卖出挂单异常：{exc}")
-                    strategy.on_reject(str(exc))
-                    continue
-                finally:
-                    selling_in_progress = False
-
-                print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
-                sell_status = str(sell_resp.get("status") or "").upper()
-                sell_filled = float(sell_resp.get("filled") or 0.0)
-                sell_avg = sell_resp.get("avg_price")
-                eps = 1e-4
-                sell_remaining = float(sell_resp.get("remaining") or 0.0)
-                dust_threshold = API_MIN_ORDER_SIZE if API_MIN_ORDER_SIZE and API_MIN_ORDER_SIZE > 0 else None
-                treat_as_dust = False
-                if dust_threshold is not None and sell_remaining > eps:
-                    if sell_remaining < dust_threshold - 1e-9:
-                        treat_as_dust = True
-                remaining_for_strategy = None if treat_as_dust else sell_remaining
-                strategy.on_sell_filled(
-                    avg_price=sell_avg if sell_filled > 0 else None,
-                    size=sell_filled if sell_filled > 0 else None,
-                    remaining=remaining_for_strategy,
+            if sell_only_event.is_set():
+                print("[COUNTDOWN] 当前处于倒计时仅卖出模式，忽略买入信号。")
+                strategy.on_reject("sell-only window active")
+                continue
+            now_for_buy = time.time()
+            if now_for_buy < buy_cooldown_until:
+                remaining = buy_cooldown_until - now_for_buy
+                print(
+                    f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
                 )
-                if sell_remaining > eps and not treat_as_dust:
-                    position_size = sell_remaining
-                    last_order_size = sell_remaining
-                    display_price = sell_avg if sell_avg is not None else floor_price
-                    print(
-                        "[STATE] 卖出部分成交 -> "
-                        f"price={display_price:.4f} sold={sell_filled:.4f} remaining={sell_remaining:.4f} status={sell_status}"
-                    )
-                else:
-                    position_size = None
-                    last_order_size = None
-                    sold_display = sell_filled if sell_filled > 0 else filled_amt
-                    display_price = sell_avg if sell_avg is not None else floor_price
-                    dust_note = ""
-                    if treat_as_dust and sell_remaining > eps and dust_threshold is not None:
-                        dust_note = (
-                            f" (剩余 {sell_remaining:.4f} < 最小挂单量 {dust_threshold:.2f}，视为完成)"
-                        )
-                    print(
-                        "[STATE] 卖出成交 -> "
-                        f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
-                    )
+                pending_buy = action
+                continue
 
-            elif action.action == ActionType.SELL:
-                print("[INFO] 收到策略 SELL 信号，但已使用 maker 卖单流程，忽略该信号。")
+            ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
+            if size_in:
+                try:
+                    order_size = float(size_in)
+                except Exception:
+                    print("[ERR] 份数非法，终止。")
+                    strategy.stop("invalid size")
+                    stop_event.set()
+                    break
+            else:
+                order_size = _calc_size_by_1dollar(ref_price)
+                print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
+
+            try:
+                buy_resp = maker_buy_follow_bid(
+                    client=client,
+                    token_id=token_id,
+                    target_size=order_size,
+                    poll_sec=10.0,
+                    min_quote_amt=1.0,
+                    min_order_size=API_MIN_ORDER_SIZE,
+                    best_bid_fn=_latest_best_bid,
+                    stop_check=stop_event.is_set,
+                )
+            except Exception as exc:
+                print(f"[ERR] 买入下单异常：{exc}")
+                strategy.on_reject(str(exc))
+                buy_cooldown_until = time.time() + short_buy_cooldown
+                continue
+            print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
+            buy_status = str(buy_resp.get("status") or "").upper()
+            filled_amt = float(buy_resp.get("filled") or 0.0)
+            avg_price = buy_resp.get("avg_price")
+            if filled_amt > 0:
+                fill_px = float(avg_price if avg_price is not None else ref_price)
+                prior_position = position_size or 0.0
+                position_size = prior_position + filled_amt
+                last_order_size = filled_amt
+                buy_filled_kwargs = {
+                    "avg_price": fill_px,
+                    "size": filled_amt,
+                }
+                if strategy_supports_total_position:
+                    buy_filled_kwargs["total_position"] = position_size
+                strategy.on_buy_filled(**buy_filled_kwargs)
+                print(
+                    f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
+                )
+            else:
+                reason_text = str(buy_resp)
+                print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
+                strategy.on_reject(reason_text)
+            buy_cooldown_until = time.time() + short_buy_cooldown
+
+            if filled_amt <= 0:
+                continue
+
+            floor_price = strategy.sell_trigger_price()
+            if floor_price is None:
+                print("[WARN] 无法计算卖出地板价，跳过卖出流程。")
+                strategy.on_reject("missing sell trigger")
+                continue
+
+            sell_resp: Dict[str, Any]
+            try:
+                sell_resp = maker_sell_follow_ask_with_floor_wait(
+                    client=client,
+                    token_id=token_id,
+                    position_size=position_size,
+                    floor_X=float(floor_price),
+                    poll_sec=10.0,
+                    min_order_size=API_MIN_ORDER_SIZE,
+                    best_ask_fn=_latest_best_ask,
+                    stop_check=stop_event.is_set,
+                )
+            except Exception as exc:
+                print(f"[ERR] 卖出挂单异常：{exc}")
+                strategy.on_reject(str(exc))
+                continue
+
+            print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
+            sell_status = str(sell_resp.get("status") or "").upper()
+            sell_filled = float(sell_resp.get("filled") or 0.0)
+            sell_avg = sell_resp.get("avg_price")
+            eps = 1e-4
+            sell_remaining = float(sell_resp.get("remaining") or 0.0)
+            dust_threshold = API_MIN_ORDER_SIZE if API_MIN_ORDER_SIZE and API_MIN_ORDER_SIZE > 0 else None
+            treat_as_dust = False
+            if dust_threshold is not None and sell_remaining > eps:
+                if sell_remaining < dust_threshold - 1e-9:
+                    treat_as_dust = True
+            remaining_for_strategy = None if treat_as_dust else sell_remaining
+            strategy.on_sell_filled(
+                avg_price=sell_avg if sell_filled > 0 else None,
+                size=sell_filled if sell_filled > 0 else None,
+                remaining=remaining_for_strategy,
+            )
+            if sell_remaining > eps and not treat_as_dust:
+                position_size = sell_remaining
+                last_order_size = sell_remaining
+                display_price = sell_avg if sell_avg is not None else floor_price
+                print(
+                    "[STATE] 卖出部分成交 -> "
+                    f"price={display_price:.4f} sold={sell_filled:.4f} remaining={sell_remaining:.4f} status={sell_status}"
+                )
+            else:
+                position_size = None
+                last_order_size = None
+                sold_display = sell_filled if sell_filled > 0 else filled_amt
+                display_price = sell_avg if sell_avg is not None else floor_price
+                dust_note = ""
+                if treat_as_dust and sell_remaining > eps and dust_threshold is not None:
+                    dust_note = (
+                        f" (剩余 {sell_remaining:.4f} < 最小挂单量 {dust_threshold:.2f}，视为完成)"
+                    )
+                print(
+                    "[STATE] 卖出成交 -> "
+                    f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
+                )
 
     except KeyboardInterrupt:
         print("[CMD] 捕获到 Ctrl+C，准备退出…")
