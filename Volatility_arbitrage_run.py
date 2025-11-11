@@ -1329,7 +1329,11 @@ def main():
                     prior_position = position_size or 0.0
                     position_size = prior_position + filled_amt
                     last_order_size = filled_amt
-                    strategy.on_buy_filled(avg_price=fill_px, size=position_size)
+                    strategy.on_buy_filled(
+                        avg_price=fill_px,
+                        size=filled_amt,
+                        total_position=position_size,
+                    )
                     print(
                         f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
                     )
