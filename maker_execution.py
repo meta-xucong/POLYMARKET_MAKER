@@ -40,6 +40,7 @@ BUY_SIZE_DP = 4
 SELL_PRICE_DP = 4
 SELL_SIZE_DP = 2
 _MIN_FILL_EPS = 1e-9
+DEFAULT_MIN_ORDER_SIZE = 5.0
 
 
 def _round_up_to_dp(value: float, dp: int) -> float:
@@ -287,6 +288,7 @@ def maker_buy_follow_bid(
     *,
     poll_sec: float = 10.0,
     min_quote_amt: float = 1.0,
+    min_order_size: float = DEFAULT_MIN_ORDER_SIZE,
     best_bid_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -294,6 +296,10 @@ def maker_buy_follow_bid(
     """Continuously maintain a maker buy order following the market bid."""
 
     goal_size = max(_ceil_to_dp(float(target_size), BUY_SIZE_DP), 0.0)
+    api_min_qty = 0.0
+    if min_order_size and min_order_size > 0:
+        api_min_qty = _ceil_to_dp(float(min_order_size), BUY_SIZE_DP)
+        goal_size = max(goal_size, api_min_qty)
     if goal_size <= 0:
         return {
             "status": "SKIPPED",
@@ -329,6 +335,9 @@ def maker_buy_follow_bid(
             break
 
         if active_order is None:
+            if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
+                final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+                break
             bid = _best_bid(client, token_id, best_bid_fn)
             if bid is None or bid <= 0:
                 sleep_fn(poll_sec)
@@ -341,6 +350,8 @@ def maker_buy_follow_bid(
             if min_quote_amt and min_quote_amt > 0:
                 min_qty = _ceil_to_dp(min_quote_amt / max(px, 1e-9), BUY_SIZE_DP)
             eff_qty = max(remaining, min_qty)
+            if api_min_qty:
+                eff_qty = max(eff_qty, api_min_qty)
             eff_qty = _ceil_to_dp(eff_qty, BUY_SIZE_DP)
             if eff_qty <= 0:
                 final_status = "SKIPPED"
@@ -393,11 +404,22 @@ def maker_buy_follow_bid(
             record["status"] = status_text
             if avg_price is not None:
                 record["avg_price"] = avg_price
+            price_display = record.get("price", active_price)
+            total_size = float(record.get("size", 0.0) or 0.0)
+            remaining_slice = max(total_size - filled_amount, 0.0)
+            if price_display is not None:
+                print(
+                    f"[MAKER][BUY] 挂单状态 -> price={float(price_display):.{BUY_PRICE_DP}f} "
+                    f"filled={filled_amount:.{BUY_SIZE_DP}f} remaining={remaining_slice:.{BUY_SIZE_DP}f} "
+                    f"status={status_text}"
+                )
 
         current_bid = _best_bid(client, token_id, best_bid_fn)
         min_buyable = 0.0
         if min_quote_amt and min_quote_amt > 0 and current_bid and current_bid > 0:
             min_buyable = _ceil_to_dp(min_quote_amt / max(current_bid, 1e-9), BUY_SIZE_DP)
+        if api_min_qty:
+            min_buyable = max(min_buyable, api_min_qty)
 
         if remaining <= _MIN_FILL_EPS or (min_buyable and remaining < min_buyable):
             if active_order:
@@ -406,7 +428,10 @@ def maker_buy_follow_bid(
                 if rec is not None:
                     rec["status"] = "CANCELLED"
                 active_order = None
-            final_status = "FILLED" if remaining <= _MIN_FILL_EPS else "FILLED_TRUNCATED"
+            if remaining <= _MIN_FILL_EPS:
+                final_status = "FILLED"
+            else:
+                final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
             break
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
@@ -450,6 +475,7 @@ def maker_sell_follow_ask_with_floor_wait(
     floor_X: float,
     *,
     poll_sec: float = 10.0,
+    min_order_size: float = DEFAULT_MIN_ORDER_SIZE,
     best_ask_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -457,6 +483,9 @@ def maker_sell_follow_ask_with_floor_wait(
     """Maintain a maker sell order while respecting a profit floor."""
 
     goal_size = max(_floor_to_dp(float(position_size), SELL_SIZE_DP), 0.0)
+    api_min_qty = 0.0
+    if min_order_size and min_order_size > 0:
+        api_min_qty = _ceil_to_dp(float(min_order_size), SELL_SIZE_DP)
     if goal_size < 0.01:
         return {
             "status": "SKIPPED",
@@ -490,6 +519,10 @@ def maker_sell_follow_ask_with_floor_wait(
                 if rec is not None:
                     rec["status"] = "CANCELLED"
             final_status = "STOPPED"
+            break
+
+        if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
+            final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
             break
 
         ask = _best_ask(client, token_id, best_ask_fn)
@@ -529,6 +562,9 @@ def maker_sell_follow_ask_with_floor_wait(
             qty = _floor_to_dp(remaining, SELL_SIZE_DP)
             if qty < 0.01:
                 final_status = "FILLED"
+                break
+            if api_min_qty and qty + _MIN_FILL_EPS < api_min_qty:
+                final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
                 break
             payload = {
                 "tokenId": token_id,
@@ -578,6 +614,26 @@ def maker_sell_follow_ask_with_floor_wait(
             record["status"] = status_text
             if avg_price is not None:
                 record["avg_price"] = avg_price
+            price_display = record.get("price", active_price)
+            total_size = float(record.get("size", 0.0) or 0.0)
+            remaining_slice = max(total_size - filled_amount, 0.0)
+            if price_display is not None:
+                print(
+                    f"[MAKER][SELL] 挂单状态 -> price={float(price_display):.{SELL_PRICE_DP}f} "
+                    f"sold={filled_amount:.{SELL_SIZE_DP}f} remaining={remaining_slice:.{SELL_SIZE_DP}f} "
+                    f"status={status_text}"
+                )
+
+        if api_min_qty and remaining < api_min_qty:
+            if active_order:
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = "CANCELLED"
+                active_order = None
+                active_price = None
+            final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+            break
 
         if remaining <= 0.0 or _floor_to_dp(remaining, SELL_SIZE_DP) < 0.01:
             if active_order:

@@ -81,6 +81,7 @@ def test_maker_buy_immediate_fill():
         token_id="tkn",
         target_size=3.0,
         poll_sec=0.0,
+        min_order_size=0.0,
         best_bid_fn=lambda: 0.5,
         sleep_fn=lambda _: None,
     )
@@ -110,6 +111,7 @@ def test_maker_buy_reprices_on_bid_rise():
         token_id="asset",
         target_size=2.0,
         poll_sec=0.0,
+        min_order_size=0.0,
         best_bid_fn=bid_supplier,
         sleep_fn=lambda _: None,
     )
@@ -132,6 +134,7 @@ def test_maker_sell_waits_for_floor_before_order():
         position_size=1.5,
         floor_X=0.70,
         poll_sec=0.0,
+        min_order_size=0.0,
         best_ask_fn=asks,
         sleep_fn=lambda _: None,
     )
