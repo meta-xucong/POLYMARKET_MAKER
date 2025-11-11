@@ -18,6 +18,7 @@ import re
 import hmac
 import hashlib
 import json
+import inspect
 from queue import Queue, Empty
 from typing import Dict, Any, Tuple, List, Optional
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
@@ -64,6 +65,24 @@ except Exception as e:
 CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = "https://gamma-api.polymarket.com"
 API_MIN_ORDER_SIZE = 5.0
+
+
+def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
+    """Return True when ``strategy.on_buy_filled`` can consume ``total_position``."""
+
+    handler = getattr(strategy, "on_buy_filled", None)
+    if handler is None or not callable(handler):
+        return False
+
+    try:
+        signature = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return False
+
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return "total_position" in signature.parameters
 
 # ===== 旧版解析器（复刻 + 极小修正） =====
 def _parse_yes_no_ids_literal(source: str) -> Tuple[Optional[str], Optional[str]]:
@@ -832,6 +851,7 @@ def main():
         profit_pct=profit_pct,
     )
     strategy = VolArbStrategy(cfg)
+    strategy_supports_total_position = _strategy_accepts_total_position(strategy)
 
     latest: Dict[str, Dict[str, Any]] = {}
     action_queue: Queue[Action] = Queue()
@@ -1319,19 +1339,13 @@ def main():
                     prior_position = position_size or 0.0
                     position_size = prior_position + filled_amt
                     last_order_size = filled_amt
-                    try:
-                        strategy.on_buy_filled(
-                            avg_price=fill_px,
-                            size=filled_amt,
-                            total_position=position_size,
-                        )
-                    except TypeError as exc:
-                        if "total_position" not in str(exc):
-                            raise
-                        strategy.on_buy_filled(
-                            avg_price=fill_px,
-                            size=filled_amt,
-                        )
+                    buy_filled_kwargs = {
+                        "avg_price": fill_px,
+                        "size": filled_amt,
+                    }
+                    if strategy_supports_total_position:
+                        buy_filled_kwargs["total_position"] = position_size
+                    strategy.on_buy_filled(**buy_filled_kwargs)
                     print(
                         f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
                     )
