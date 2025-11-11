@@ -122,6 +122,24 @@ def test_maker_buy_reprices_on_bid_rise():
     assert first_order["price"] == pytest.approx(0.50, rel=0, abs=1e-9)
 
 
+def test_maker_buy_handles_missing_fill_amount_on_match():
+    client = DummyClient(status_sequences=[[{"status": "MATCHED"}]])
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=5.0,
+        poll_sec=0.0,
+        min_order_size=0.0,
+        best_bid_fn=lambda: 0.5,
+        sleep_fn=lambda _: None,
+    )
+
+    assert result["status"] == "FILLED"
+    assert result["filled"] == pytest.approx(5.0)
+    assert client.created_orders, "expected order to be created"
+
+
 def test_maker_sell_waits_for_floor_before_order():
     client = DummyClient(
         status_sequences=[[{"status": "FILLED", "filledAmount": 1.5, "avgPrice": 0.72}]]
