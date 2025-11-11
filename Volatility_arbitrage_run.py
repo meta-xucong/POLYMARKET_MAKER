@@ -29,8 +29,10 @@ from Volatility_arbitrage_strategy import (
     ActionType,
     Action,
 )
-from Volatility_buy import execute_auto_buy  # BUY 规范化逻辑统一交由执行器实现
-from Volatility_sell import execute_auto_sell
+from maker_execution import (
+    maker_buy_follow_bid,
+    maker_sell_follow_ask_with_floor_wait,
+)
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -970,87 +972,6 @@ def main():
                             queue.append(sub)
         return False
 
-    def _extract_field(resp: Any, key: str) -> Any:
-        if isinstance(resp, dict):
-            return resp.get(key)
-        if hasattr(resp, key):
-            return getattr(resp, key)
-        return None
-
-    def _extract_price(resp: Any, fallback: float) -> float:
-        for key in (
-            "avg_price",
-            "avgPrice",
-            "filled_avg_price",
-            "filledAvgPrice",
-            "price",
-            "last_price",
-            "lastPrice",
-            "limit_price",
-            "limitPrice",
-        ):
-            val = _extract_field(resp, key)
-            if val is None:
-                continue
-            try:
-                return float(val)
-            except Exception:
-                continue
-        return float(fallback)
-
-    def _extract_filled(resp: Any) -> Optional[float]:
-        for key in (
-            "filled",
-            "filled_size",
-            "filledSize",
-            "filled_amount",
-            "filledAmount",
-            "makingAmount",
-        ):
-            val = _extract_field(resp, key)
-            if val is None:
-                continue
-            try:
-                return float(val)
-            except Exception:
-                continue
-        return None
-
-    def _extract_size(resp: Any, fallback: float) -> float:
-        filled = _extract_filled(resp)
-        if filled is not None:
-            return float(filled)
-        return float(fallback)
-
-    def _extract_remaining(resp: Any) -> Optional[float]:
-        val = _extract_field(resp, "remaining")
-        if val is not None:
-            try:
-                return max(float(val), 0.0)
-            except (TypeError, ValueError):
-                pass
-        requested_val = _extract_field(resp, "requested")
-        filled_val = _extract_filled(resp)
-        try:
-            requested = float(requested_val) if requested_val is not None else None
-        except (TypeError, ValueError):
-            requested = None
-        try:
-            filled = float(filled_val) if filled_val is not None else None
-        except (TypeError, ValueError):
-            filled = None
-        if requested is not None and filled is not None:
-            return max(requested - filled, 0.0)
-        return None
-
-    def _status_lower(resp: Any) -> str:
-        val = _extract_field(resp, "status")
-        if isinstance(val, str):
-            return val.lower()
-        if isinstance(resp, str):
-            return resp.lower()
-        return ""
-
     def _parse_price_change(pc: Dict[str, Any]) -> Tuple[float, float, float]:
         def _to_float(val: Any) -> Optional[float]:
             if val is None:
@@ -1093,7 +1014,7 @@ def main():
         )
 
     def _on_event(ev: Dict[str, Any]):
-        nonlocal market_closed_detected
+        nonlocal market_closed_detected, selling_in_progress
         if stop_event.is_set():
             return
         if not isinstance(ev, dict):
@@ -1119,6 +1040,8 @@ def main():
             latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask}
             action = strategy.on_tick(best_ask=ask, best_bid=bid, ts=ts)
             if action:
+                if action.action == ActionType.SELL and selling_in_progress:
+                    continue
                 action_queue.put(action)
             if _is_market_closed(pc):
                 print("[MARKET] 检测到市场关闭信号，准备退出…")
@@ -1269,16 +1192,22 @@ def main():
             return "-"
         return f"{sec / 60.0:.1f}m"
 
-    success_status = {
-        "success",
-        "matched",
-        "filled",
-        "complete",
-        "completed",
-        "executed",
-        "accepted",
-        "partial",
-    }
+    def _latest_best_bid() -> Optional[float]:
+        snap = latest.get(token_id) or {}
+        try:
+            value = snap.get("best_bid")
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _latest_best_ask() -> Optional[float]:
+        snap = latest.get(token_id) or {}
+        try:
+            value = snap.get("best_ask")
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
     last_log = 0.0
@@ -1286,6 +1215,7 @@ def main():
     buy_cooldown_reason: Optional[str] = None
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
+    selling_in_progress = False
 
     try:
         while not stop_event.is_set():
@@ -1413,11 +1343,14 @@ def main():
                     print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
 
                 try:
-                    resp = execute_auto_buy(
+                    buy_resp = maker_buy_follow_bid(
                         client=client,
                         token_id=token_id,
-                        price=ref_price,
-                        size=order_size,
+                        target_size=order_size,
+                        poll_sec=10.0,
+                        min_quote_amt=1.0,
+                        best_bid_fn=_latest_best_bid,
+                        stop_check=stop_event.is_set,
                     )
                 except Exception as exc:
                     print(f"[ERR] 买入下单异常：{exc}")
@@ -1425,107 +1358,86 @@ def main():
                     buy_cooldown_until = time.time() + short_buy_cooldown
                     buy_cooldown_reason = "buy"
                     continue
-                print(f"[TRADE][BUY] resp={resp}")
-                status = _status_lower(resp)
-                status_display = status.upper() if status else "N/A"
-                filled_amt = _extract_size(resp, 0.0)
-                success = status in success_status or (filled_amt and filled_amt > 0)
-                if success and filled_amt > 0:
-                    fill_px = _extract_price(resp, ref_price)
-                    position_size = float(filled_amt)
-                    last_order_size = float(filled_amt)
+                print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
+                buy_status = str(buy_resp.get("status") or "").upper()
+                filled_amt = float(buy_resp.get("filled") or 0.0)
+                avg_price = buy_resp.get("avg_price")
+                if filled_amt > 0:
+                    fill_px = float(avg_price if avg_price is not None else ref_price)
+                    position_size = filled_amt
+                    last_order_size = filled_amt
                     strategy.on_buy_filled(avg_price=fill_px, size=position_size)
                     print(
-                        f"[STATE] 买入成交 -> status={status_display} price={fill_px:.4f} size={position_size:.4f}"
+                        f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
                     )
                 else:
-                    reason_raw = _extract_field(resp, "message")
-                    if reason_raw is None and isinstance(resp, dict):
-                        reason_raw = resp.get("message")
-                    reason_text = str(reason_raw if reason_raw is not None else resp)
-                    print(f"[WARN] 买入未成交(status={status_display})：{reason_text}")
+                    reason_text = str(buy_resp)
+                    print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
                     strategy.on_reject(reason_text)
                 buy_cooldown_until = time.time() + short_buy_cooldown
                 buy_cooldown_reason = "buy"
 
-            elif action.action == ActionType.SELL:
-                ref_price = action.ref_price or bid or float(snap.get("price") or 0.0)
-                sell_size = position_size
-                if sell_size is None:
-                    try:
-                        st_now = strategy.status()
-                        ps = st_now.get("position_size")
-                        sell_size = float(ps) if ps is not None else None
-                    except Exception:
-                        sell_size = None
-                if sell_size is None or sell_size <= 0:
-                    sell_size = last_order_size
-                if sell_size is None or sell_size <= 0:
-                    print("[WARN] 无可用持仓，忽略卖出信号。")
-                    strategy.on_reject("empty position")
+                if filled_amt <= 0:
                     continue
 
+                floor_price = strategy.sell_trigger_price()
+                if floor_price is None:
+                    print("[WARN] 无法计算卖出地板价，跳过卖出流程。")
+                    strategy.on_reject("missing sell trigger")
+                    continue
+
+                selling_in_progress = True
+                sell_resp: Dict[str, Any]
                 try:
-                    resp = execute_auto_sell(
+                    sell_resp = maker_sell_follow_ask_with_floor_wait(
                         client=client,
                         token_id=token_id,
-                        price=ref_price,
-                        size=sell_size,
+                        position_size=position_size,
+                        floor_X=float(floor_price),
+                        poll_sec=10.0,
+                        best_ask_fn=_latest_best_ask,
+                        stop_check=stop_event.is_set,
                     )
                 except Exception as exc:
-                    print(f"[ERR] 卖出下单异常：{exc}")
+                    print(f"[ERR] 卖出挂单异常：{exc}")
                     strategy.on_reject(str(exc))
                     continue
-                print(f"[TRADE][SELL] resp={resp}")
-                status = _status_lower(resp)
-                filled_amt = max(_extract_size(resp, 0.0), 0.0)
-                remaining_amt = _extract_remaining(resp)
-                base_remaining = None
-                if remaining_amt is None:
-                    base_remaining = sell_size if sell_size is not None else position_size
-                    if base_remaining is None:
-                        requested_val = _extract_field(resp, "requested")
-                        if requested_val is not None:
-                            try:
-                                base_remaining = float(requested_val)
-                            except (TypeError, ValueError):
-                                base_remaining = None
-                    if base_remaining is not None:
-                        remaining_amt = max(float(base_remaining) - filled_amt, 0.0)
+                finally:
+                    selling_in_progress = False
 
+                print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
+                sell_status = str(sell_resp.get("status") or "").upper()
+                sell_filled = float(sell_resp.get("filled") or 0.0)
+                sell_avg = sell_resp.get("avg_price")
+                sell_remaining = float(sell_resp.get("remaining") or 0.0)
+                strategy.on_sell_filled(
+                    avg_price=sell_avg if sell_filled > 0 else None,
+                    size=sell_filled if sell_filled > 0 else None,
+                    remaining=sell_remaining,
+                )
                 eps = 1e-4
-                if remaining_amt is not None and remaining_amt <= eps:
-                    remaining_amt = 0.0
-
-                sold_success = status in success_status or filled_amt > eps
-                if sold_success:
-                    fill_px = _extract_price(resp, ref_price)
-                    strategy.on_sell_filled(
-                        avg_price=fill_px if filled_amt > 0 else None,
-                        size=filled_amt if filled_amt > 0 else None,
-                        remaining=remaining_amt,
+                if sell_remaining > eps:
+                    position_size = sell_remaining
+                    last_order_size = sell_remaining
+                    display_price = sell_avg if sell_avg is not None else floor_price
+                    print(
+                        "[STATE] 卖出部分成交 -> "
+                        f"price={display_price:.4f} sold={sell_filled:.4f} remaining={sell_remaining:.4f} status={sell_status}"
                     )
-                    if remaining_amt and remaining_amt > eps:
-                        position_size = remaining_amt
-                        last_order_size = remaining_amt
-                        print(
-                            "[STATE] 卖出部分成交 -> "
-                            f"price={fill_px:.4f} sold={filled_amt:.4f} remaining={remaining_amt:.4f}"
-                        )
-                    else:
-                        position_size = None
-                        last_order_size = None
-                        buy_cooldown_until = time.time() + 15.0
-                        buy_cooldown_reason = "sell"
-                        sold_display = filled_amt if filled_amt > 0 else (sell_size or 0.0)
-                        print(
-                            "[STATE] 卖出成交 -> "
-                            f"price={fill_px:.4f} size={sold_display:.4f}"
-                        )
                 else:
-                    reason = resp.get("message") if isinstance(resp, dict) else str(resp)
-                    print(f"[WARN] 卖出未成交：{reason}")
-                    strategy.on_reject(reason if isinstance(reason, str) else None)
+                    position_size = None
+                    last_order_size = None
+                    buy_cooldown_until = time.time() + 15.0
+                    buy_cooldown_reason = "sell"
+                    sold_display = sell_filled if sell_filled > 0 else filled_amt
+                    display_price = sell_avg if sell_avg is not None else floor_price
+                    print(
+                        "[STATE] 卖出成交 -> "
+                        f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}"
+                    )
+
+            elif action.action == ActionType.SELL:
+                print("[INFO] 收到策略 SELL 信号，但已使用 maker 卖单流程，忽略该信号。")
 
     except KeyboardInterrupt:
         print("[CMD] 捕获到 Ctrl+C，准备退出…")
