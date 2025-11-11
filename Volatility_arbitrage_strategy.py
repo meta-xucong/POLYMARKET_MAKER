@@ -300,14 +300,77 @@ class VolArbStrategy:
         self._current_drop_ratio = current_drop
 
     # ------------------------ 上游回调：成交/被拒 ------------------------
-    def on_buy_filled(self, avg_price: float, size: Optional[float] = None) -> None:
-        """上游在实际买入成交后回调。"""
-        if self._awaiting == ActionType.BUY:
-            self._state = "LONG"
+    def on_buy_filled(
+        self,
+        avg_price: float,
+        size: Optional[float] = None,
+        *,
+        total_position: Optional[float] = None,
+    ) -> None:
+        """上游在实际买入成交后回调。
+
+        :param avg_price: 本次成交的平均买入价。
+        :param size: 上游回报的成交份数。缺省视为“新增仓位”。
+        :param total_position: 上游若能提供买入后的总持仓，优先使用该值。
+        """
+        prior_size = 0.0
+        if self._position_size is not None:
+            try:
+                prior_size = max(float(self._position_size), 0.0)
+            except (TypeError, ValueError):
+                prior_size = 0.0
+
+        def _safe_non_negative(value: Optional[float]) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            return numeric if numeric > 0 else (0.0 if numeric >= 0 else None)
+
+        added_size: float = 0.0
+        new_total: Optional[float] = None
+
+        explicit_total = _safe_non_negative(total_position)
+        if explicit_total is not None:
+            new_total = explicit_total
+            added_size = max(new_total - prior_size, 0.0)
+        else:
+            filled_amt = _safe_non_negative(size)
+            if filled_amt is not None:
+                added_size = filled_amt
+                if prior_size > 0:
+                    new_total = prior_size + filled_amt
+                else:
+                    new_total = filled_amt
+
+        if new_total is not None and new_total > 0:
+            if prior_size > 0 and added_size > 0 and self._entry_price is not None:
+                total_for_weight = prior_size + added_size if explicit_total is None else new_total
+                if total_for_weight <= 0:
+                    total_for_weight = new_total
+                self._entry_price = (
+                    float(self._entry_price) * prior_size + avg_price * added_size
+                ) / max(total_for_weight, 1e-12)
+            elif prior_size <= 0:
+                self._entry_price = avg_price
+            else:
+                # 无新增仓位（或旧成本缺失），沿用已有成本
+                self._entry_price = (
+                    self._entry_price if self._entry_price is not None else avg_price
+                )
+            self._position_size = new_total if new_total > 0 else None
+        else:
+            # 回退逻辑：若无法解析新仓位，则至少记录最新价格
             self._entry_price = avg_price
-            self._last_buy_price = avg_price
             if size is not None:
-                self._position_size = float(size)
+                filled_amt = _safe_non_negative(size)
+                if filled_amt is not None:
+                    self._position_size = filled_amt
+
+        self._last_buy_price = avg_price
+        self._state = "LONG"
         self._awaiting = None
         self._last_reject_reason = None
 
@@ -343,10 +406,10 @@ class VolArbStrategy:
             remaining_size = None
 
         if remaining_size is None:
+            self._state = "FLAT"
+            self._entry_price = None
+            self._position_size = None
             if self._awaiting == ActionType.SELL:
-                self._state = "FLAT"
-                self._entry_price = None
-                self._position_size = None
                 self._awaiting = None
         else:
             self._position_size = remaining_size
@@ -354,6 +417,10 @@ class VolArbStrategy:
                 # 仍有仓位未卖完，解除等待以便继续发 SELL 信号
                 self._awaiting = None
             self._state = "LONG"
+
+        if remaining_size is None and self._awaiting is not None:
+            # 清理非 SELL 的等待状态，确保重新触发买入
+            self._awaiting = None
 
         if avg_price is not None:
             self._last_sell_price = avg_price
