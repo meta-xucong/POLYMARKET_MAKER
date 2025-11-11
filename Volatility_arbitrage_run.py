@@ -1188,6 +1188,53 @@ def main():
                     action_queue.put(pending_buy)
                     pending_buy = None
 
+            if now - last_log >= 1.0:
+                snap = latest.get(token_id) or {}
+                bid = float(snap.get("best_bid") or 0.0)
+                ask = float(snap.get("best_ask") or 0.0)
+                last_px = float(snap.get("price") or 0.0)
+                st = strategy.status()
+                awaiting = st.get("awaiting")
+                awaiting_s = awaiting.value if hasattr(awaiting, "value") else awaiting
+                entry_price = st.get("entry_price")
+                print(
+                    f"[PX] bid={bid:.4f} ask={ask:.4f} last={last_px:.4f} | "
+                    f"state={st.get('state')} awaiting={awaiting_s} entry={entry_price}"
+                )
+
+                extra_lines: List[str] = []
+
+                drop_stats = st.get("drop_stats") or {}
+                config_snapshot = st.get("config") or {}
+                history_len = st.get("price_history_len")
+                history_display = history_len if history_len is not None else "-"
+                window_seconds = drop_stats.get("window_seconds")
+                extra_lines.append(
+                    "    时间窗口: "
+                    f"{_fmt_minutes(window_seconds)} | 采样点数: {history_display}"
+                )
+
+                drop_line = (
+                    "    窗口跌幅: 当前 "
+                    f"{_fmt_pct(drop_stats.get('current_drop_ratio'))} / 最大 "
+                    f"{_fmt_pct(drop_stats.get('max_drop_ratio'))} / 阈值 "
+                    f"{_fmt_pct(config_snapshot.get('drop_pct'))}"
+                )
+                extra_lines.append(drop_line)
+
+                price_line = (
+                    "    窗口价格: 高 "
+                    f"{_fmt_price(drop_stats.get('window_high'))} / 低 "
+                    f"{_fmt_price(drop_stats.get('window_low'))}"
+                )
+                extra_lines.append(price_line)
+
+                if st.get("sell_only"):
+                    extra_lines.append("    状态：倒计时仅卖出模式（禁止买入）")
+                for line in extra_lines:
+                    print(line)
+                last_log = now
+
             try:
                 action = action_queue.get(timeout=0.5)
             except Empty:
