@@ -266,6 +266,9 @@ def _update_fill_totals(
     accounted: Dict[str, float],
     notional_sum: float,
     last_known_price: float,
+    *,
+    status_text: Optional[str] = None,
+    expected_full_size: Optional[float] = None,
 ) -> Tuple[float, float, float]:
     filled_amount = float(status_payload.get("filledAmount", 0.0) or 0.0)
     avg_price = status_payload.get("avgPrice")
@@ -273,6 +276,12 @@ def _update_fill_totals(
         avg_price = last_known_price
     else:
         avg_price = float(avg_price)
+
+    if filled_amount <= _MIN_FILL_EPS and status_text:
+        status_upper = status_text.upper()
+        if status_upper in {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}:
+            if expected_full_size is not None and expected_full_size > 0:
+                filled_amount = max(filled_amount, float(expected_full_size))
 
     previous = accounted.get(order_id, 0.0)
     delta = max(filled_amount - previous, 0.0)
@@ -393,15 +402,33 @@ def maker_buy_follow_bid(
             status_payload = {"status": "UNKNOWN", "filledAmount": accounted.get(active_order, 0.0)}
 
         record = records.get(active_order)
+        status_text = str(status_payload.get("status", "UNKNOWN"))
+        record_size = None
+        if record is not None:
+            try:
+                record_size = float(record.get("size", 0.0) or 0.0)
+            except Exception:
+                record_size = None
+        last_price_hint = active_price
+        if last_price_hint is None:
+            last_price_hint = _coerce_float(status_payload.get("avgPrice"))
+        if last_price_hint is None:
+            last_price_hint = 0.0
         filled_amount, avg_price, notional_sum = _update_fill_totals(
-            active_order, status_payload, accounted, notional_sum, active_price or status_payload.get("avgPrice", 0.0)
+            active_order,
+            status_payload,
+            accounted,
+            notional_sum,
+            float(last_price_hint),
+            status_text=status_text,
+            expected_full_size=record_size,
         )
         filled_total = sum(accounted.values())
         remaining = max(goal_size - filled_total, 0.0)
-        status_text = str(status_payload.get("status", "UNKNOWN")).upper()
+        status_text_upper = status_text.upper()
         if record is not None:
             record["filled"] = filled_amount
-            record["status"] = status_text
+            record["status"] = status_text_upper
             if avg_price is not None:
                 record["avg_price"] = avg_price
             price_display = record.get("price", active_price)
@@ -411,7 +438,7 @@ def maker_buy_follow_bid(
                 print(
                     f"[MAKER][BUY] 挂单状态 -> price={float(price_display):.{BUY_PRICE_DP}f} "
                     f"filled={filled_amount:.{BUY_SIZE_DP}f} remaining={remaining_slice:.{BUY_SIZE_DP}f} "
-                    f"status={status_text}"
+                    f"status={status_text_upper}"
                 )
 
         current_bid = _best_bid(client, token_id, best_bid_fn)
@@ -448,11 +475,11 @@ def maker_buy_follow_bid(
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
         cancel_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
-        if status_text in final_states:
+        if status_text_upper in final_states:
             active_order = None
             active_price = None
             continue
-        if status_text in cancel_states:
+        if status_text_upper in cancel_states:
             active_order = None
             active_price = None
             continue
@@ -603,15 +630,33 @@ def maker_sell_follow_ask_with_floor_wait(
             status_payload = {"status": "UNKNOWN", "filledAmount": accounted.get(active_order, 0.0)}
 
         record = records.get(active_order)
+        status_text = str(status_payload.get("status", "UNKNOWN"))
+        record_size = None
+        if record is not None:
+            try:
+                record_size = float(record.get("size", 0.0) or 0.0)
+            except Exception:
+                record_size = None
+        last_price_hint = active_price
+        if last_price_hint is None:
+            last_price_hint = _coerce_float(status_payload.get("avgPrice"))
+        if last_price_hint is None:
+            last_price_hint = floor_X
         filled_amount, avg_price, notional_sum = _update_fill_totals(
-            active_order, status_payload, accounted, notional_sum, active_price or status_payload.get("avgPrice", floor_X)
+            active_order,
+            status_payload,
+            accounted,
+            notional_sum,
+            float(last_price_hint),
+            status_text=status_text,
+            expected_full_size=record_size,
         )
         filled_total = sum(accounted.values())
         remaining = max(goal_size - filled_total, 0.0)
-        status_text = str(status_payload.get("status", "UNKNOWN")).upper()
+        status_text_upper = status_text.upper()
         if record is not None:
             record["filled"] = filled_amount
-            record["status"] = status_text
+            record["status"] = status_text_upper
             if avg_price is not None:
                 record["avg_price"] = avg_price
             price_display = record.get("price", active_price)
@@ -621,7 +666,7 @@ def maker_sell_follow_ask_with_floor_wait(
                 print(
                     f"[MAKER][SELL] 挂单状态 -> price={float(price_display):.{SELL_PRICE_DP}f} "
                     f"sold={filled_amount:.{SELL_SIZE_DP}f} remaining={remaining_slice:.{SELL_SIZE_DP}f} "
-                    f"status={status_text}"
+                    f"status={status_text_upper}"
                 )
 
         if api_min_qty and remaining < api_min_qty:
@@ -677,11 +722,11 @@ def maker_sell_follow_ask_with_floor_wait(
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
         cancel_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
-        if status_text in final_states:
+        if status_text_upper in final_states:
             active_order = None
             active_price = None
             continue
-        if status_text in cancel_states:
+        if status_text_upper in cancel_states:
             active_order = None
             active_price = None
             continue
