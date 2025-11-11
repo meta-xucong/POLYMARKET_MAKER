@@ -1190,7 +1190,12 @@ def main():
 
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
-    last_log = 0.0
+    status_snapshot = strategy.status()
+    initial_pos = _extract_position_size(status_snapshot)
+    if initial_pos > 0:
+        position_size = initial_pos
+        last_order_size = initial_pos
+    last_log: Optional[float] = None
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
@@ -1208,7 +1213,7 @@ def main():
                     action_queue.put(pending_buy)
                     pending_buy = None
 
-            if now - last_log >= 1.0:
+            if last_log is None or now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
                 bid = float(snap.get("best_bid") or 0.0)
                 ask = float(snap.get("best_ask") or 0.0)
@@ -1248,13 +1253,6 @@ def main():
                     f"{_fmt_price(drop_stats.get('window_low'))}"
                 )
                 extra_lines.append(price_line)
-
-                if st.get("state") == "LONG":
-                    sell_target = st.get("sell_trigger")
-                    if sell_target is not None:
-                        extra_lines.append(f"    目标卖出价格: {float(sell_target):.4f}")
-                    else:
-                        extra_lines.append("    目标卖出价格: -")
 
                 if st.get("sell_only"):
                     extra_lines.append("    状态：倒计时仅卖出模式（禁止买入）")
@@ -1379,8 +1377,7 @@ def main():
                 )
             except Exception as exc:
                 print(f"[ERR] 卖出挂单异常：{exc}")
-                strategy.on_reject(str(exc))
-                continue
+                raise
 
             print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
             sell_status = str(sell_resp.get("status") or "").upper()
