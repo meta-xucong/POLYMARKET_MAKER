@@ -304,10 +304,44 @@ class VolArbStrategy:
         """上游在实际买入成交后回调。"""
         if self._awaiting == ActionType.BUY:
             self._state = "LONG"
-            self._entry_price = avg_price
-            self._last_buy_price = avg_price
+            prior_size = 0.0
+            if self._position_size is not None:
+                try:
+                    prior_size = max(float(self._position_size), 0.0)
+                except (TypeError, ValueError):
+                    prior_size = 0.0
+
+            new_total: Optional[float] = None
             if size is not None:
-                self._position_size = float(size)
+                try:
+                    new_total = max(float(size), 0.0)
+                except (TypeError, ValueError):
+                    new_total = None
+
+            added_size: float = 0.0
+            if new_total is not None:
+                added_size = max(new_total - prior_size, 0.0)
+
+            if new_total is not None and new_total > 0:
+                if prior_size > 0 and added_size > 0 and self._entry_price is not None:
+                    weighted_cost = (
+                        float(self._entry_price) * prior_size + avg_price * added_size
+                    ) / new_total
+                    self._entry_price = weighted_cost
+                elif prior_size <= 0:
+                    self._entry_price = avg_price
+                else:
+                    # 无新增仓位（或旧成本缺失），沿用已有成本
+                    self._entry_price = (
+                        self._entry_price if self._entry_price is not None else avg_price
+                    )
+                self._position_size = new_total if new_total > 0 else None
+            else:
+                # 回退逻辑：若无法解析新仓位，则至少记录最新价格
+                self._entry_price = avg_price
+                if size is not None:
+                    self._position_size = max(float(size), 0.0)
+            self._last_buy_price = avg_price
         self._awaiting = None
         self._last_reject_reason = None
 

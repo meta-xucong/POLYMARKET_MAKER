@@ -1326,7 +1326,8 @@ def main():
                 avg_price = buy_resp.get("avg_price")
                 if filled_amt > 0:
                     fill_px = float(avg_price if avg_price is not None else ref_price)
-                    position_size = filled_amt
+                    prior_position = position_size or 0.0
+                    position_size = prior_position + filled_amt
                     last_order_size = filled_amt
                     strategy.on_buy_filled(avg_price=fill_px, size=position_size)
                     print(
