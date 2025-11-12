@@ -507,19 +507,26 @@ def _list_markets_under_event(event_slug: str) -> List[dict]:
     if not event_slug:
         return []
     # A) /events?slug=<slug>
-    data = _http_json(f"{GAMMA_ROOT}/events", params={"slug": event_slug, "closed": "false"})
-    evs = []
-    if isinstance(data, dict) and "data" in data:
-        evs = data["data"]
-    elif isinstance(data, list):
-        evs = data
-    if isinstance(evs, list):
-        for ev in evs:
-            mkts = ev.get("markets") or []
-            if mkts:
-                return mkts
+    for closed_flag in ("false", "true", None):
+        params = {"slug": event_slug}
+        if closed_flag is not None:
+            params["closed"] = closed_flag
+        data = _http_json(f"{GAMMA_ROOT}/events", params=params)
+        evs = []
+        if isinstance(data, dict) and "data" in data:
+            evs = data["data"]
+        elif isinstance(data, list):
+            evs = data
+        if isinstance(evs, list):
+            for ev in evs:
+                mkts = ev.get("markets") or []
+                if mkts:
+                    return mkts
+        # 若找到事件但 markets 为空，则无需继续尝试其它 closed_flag
+        if evs:
+            break
     # B) /markets?search=<slug> 精确过滤 eventSlug
-    data = _http_json(f"{GAMMA_ROOT}/markets", params={"limit": 200, "active": "true", "search": event_slug})
+    data = _http_json(f"{GAMMA_ROOT}/markets", params={"limit": 200, "search": event_slug})
     mkts = []
     if isinstance(data, dict) and "data" in data:
         mkts = data["data"]
@@ -584,29 +591,47 @@ def _tokens_from_market_obj(m: dict) -> Tuple[str, str, str]:
         return str(y), str(n), title
     return yes_id, no_id, title
 
+def _looks_like_event_source(source: str) -> bool:
+    """Return True when *source* clearly refers to an event rather than a market."""
+
+    if not isinstance(source, str):
+        return False
+    lower = source.strip().lower()
+    if not lower:
+        return False
+    if "/event/" in lower:
+        return True
+    # 兼容直接输入 event-xxx 这类 slug（旧脚本支持粘贴 slug）。
+    if lower.startswith("event-"):
+        return True
+    return False
+
+
 def _resolve_with_fallback(source: str) -> Tuple[str, str, str, Dict[str, Any]]:
     # 1) "YES_id,NO_id"
     y, n = _parse_yes_no_ids_literal(source)
     if y and n:
         return y, n, "(Manual IDs)", {}
     # 2) 先尝试旧解析器（单一市场 URL/slug）
-    try:
-        y1, n1, title1, raw1 = resolve_token_ids(source)
-        if y1 and n1:
-            meta = _market_meta_from_obj(raw1 or {}) if raw1 else {}
-            if not meta:
-                meta = _maybe_fetch_market_meta_from_source(source)
-            return y1, n1, title1, meta
-    except Exception:
-        pass
+    if not _looks_like_event_source(source):
+        try:
+            y1, n1, title1, raw1 = resolve_token_ids(source)
+            if y1 and n1:
+                meta = _market_meta_from_obj(raw1 or {}) if raw1 else {}
+                if not meta:
+                    meta = _maybe_fetch_market_meta_from_source(source)
+                return y1, n1, title1, meta
+        except Exception:
+            pass
     # 2.5) 若上一步失败：把输入当作可能的 market slug（含 /event 路由别名）
     cand_slugs: List[str] = []
-    ms = _extract_market_slug(source)
-    if ms:
-        cand_slugs.append(ms)
-    es = _extract_event_slug(source)
-    if es and es not in cand_slugs:
-        cand_slugs.append(es)
+    if not _looks_like_event_source(source):
+        ms = _extract_market_slug(source)
+        if ms:
+            cand_slugs.append(ms)
+        es = _extract_event_slug(source)
+        if es and es not in cand_slugs:
+            cand_slugs.append(es)
     for slug in cand_slugs:
         # A) 直接按 /markets/slug/<slug>
         m = _fetch_market_by_slug(slug)
@@ -633,9 +658,6 @@ def _resolve_with_fallback(source: str) -> Tuple[str, str, str, Dict[str, Any]]:
                     for m2 in mkts:
                         if str(m2.get("eventSlug") or "") == slug:
                             hit = m2; break
-                # 仍无则取第一条
-                if not hit:
-                    hit = mkts[0]
                 if hit:
                     yx, nx, tx = _tokens_from_market_obj(hit)
                     if yx and nx:
