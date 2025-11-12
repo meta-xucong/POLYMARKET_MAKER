@@ -63,7 +63,8 @@ except Exception as e:
     sys.exit(1)
 
 CLOB_API_HOST = "https://clob.polymarket.com"
-GAMMA_ROOT = "https://gamma-api.polymarket.com"
+GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
+DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
 API_MIN_ORDER_SIZE = 5.0
 
 
@@ -420,50 +421,302 @@ def _extract_positions_from_data_api_response(payload: Any) -> Optional[List[dic
     return None
 
 
+def _normalize_wallet_address(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            hexed = value.hex()
+        except Exception:
+            return None
+        return hexed if hexed else None
+    if isinstance(value, str):
+        candidate = value.strip()
+        return candidate or None
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            candidate = _normalize_wallet_address(item)
+            if candidate:
+                return candidate
+        return None
+    if isinstance(value, dict):
+        keys = (
+            "address",
+            "wallet",
+            "walletAddress",
+            "wallet_address",
+            "funder",
+            "owner",
+            "defaultAddress",
+            "default_address",
+        )
+        for key in keys:
+            candidate = _normalize_wallet_address(value.get(key))
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_wallet_address(client) -> Tuple[Optional[str], str]:
+    if client is not None:
+        direct_attrs = (
+            "funder",
+            "owner",
+            "address",
+            "wallet",
+            "wallet_address",
+            "walletAddress",
+            "default_address",
+            "defaultAddress",
+            "deposit_address",
+            "depositAddress",
+        )
+        for attr in direct_attrs:
+            try:
+                cand = getattr(client, attr, None)
+            except Exception:
+                continue
+            address = _normalize_wallet_address(cand)
+            if address:
+                return address, f"client.{attr}"
+
+        try:
+            attrs = list(dir(client))
+        except Exception:
+            attrs = []
+        for attr in attrs:
+            if "address" not in attr.lower():
+                continue
+            if attr in direct_attrs:
+                continue
+            try:
+                cand = getattr(client, attr, None)
+            except Exception:
+                continue
+            address = _normalize_wallet_address(cand)
+            if address:
+                return address, f"client.{attr}"
+
+    env_candidates = (
+        "POLY_DATA_ADDRESS",
+        "POLY_FUNDER",
+        "POLY_WALLET",
+        "POLY_ADDRESS",
+    )
+    for env_name in env_candidates:
+        cand = os.getenv(env_name)
+        address = _normalize_wallet_address(cand)
+        if address:
+            return address, f"env:{env_name}"
+
+    return None, "缺少地址，无法从数据接口拉取持仓。"
+
+
 def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
-    address = None
-    for attr in ("funder", "owner", "address", "wallet"):
-        cand = getattr(client, attr, None)
-        if cand:
-            address = cand
-            break
+    address, origin_hint = _resolve_wallet_address(client)
 
     if not address:
-        return [], False, "缺少地址，无法从数据接口拉取持仓。"
+        return [], False, origin_hint
+
+    url = f"{DATA_API_ROOT}/positions"
 
     limit = 500
     offset = 0
     collected: List[dict] = []
     total_records: Optional[int] = None
-    url = f"{GAMMA_ROOT}/positions"
 
-    try:
-        while True:
-            params = {"address": address, "limit": limit, "offset": offset}
+    while True:
+        params = {"user": address, "limit": limit, "offset": offset}
+        try:
             resp = requests.get(url, params=params, timeout=10)
+        except requests.RequestException as exc:
+            return [], False, f"数据接口请求失败：{exc}"
+
+        if resp.status_code == 404:
+            return [], False, "数据接口返回 404（请确认使用 Proxy/Deposit 地址查询 user 参数）"
+
+        try:
             resp.raise_for_status()
+        except requests.RequestException as exc:
+            return [], False, f"数据接口请求失败：{exc}"
+
+        try:
             payload = resp.json()
-            positions = _extract_positions_from_data_api_response(payload)
-            if positions is None:
-                return [], False, "数据接口返回格式异常，缺少 data 字段。"
-            collected.extend(positions)
-            meta = payload.get("meta") if isinstance(payload, dict) else {}
-            if isinstance(meta, dict):
-                raw_total = meta.get("total") or meta.get("count")
-                try:
-                    if raw_total is not None:
-                        total_records = int(raw_total)
-                except (TypeError, ValueError):
-                    total_records = None
-            if not positions or (total_records is not None and len(collected) >= total_records):
-                break
-            offset += len(positions)
-    except requests.RequestException as exc:
-        return [], False, f"请求失败：{exc}"
+        except ValueError:
+            return [], False, "数据接口响应解析失败"
+
+        positions = _extract_positions_from_data_api_response(payload)
+        if positions is None:
+            return [], False, "数据接口返回格式异常，缺少 data 字段。"
+
+        collected.extend(positions)
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        if isinstance(meta, dict):
+            raw_total = meta.get("total") or meta.get("count")
+            try:
+                if raw_total is not None:
+                    total_records = int(raw_total)
+            except (TypeError, ValueError):
+                total_records = None
+
+        if not positions or (total_records is not None and len(collected) >= total_records):
+            break
+
+        offset += len(positions)
 
     total = total_records if total_records is not None else len(collected)
-    origin = f"data-api positions(limit={limit}, total={total})"
+    origin_detail = f" via {origin_hint}" if origin_hint else ""
+    origin = f"data-api positions(limit={limit}, total={total}, param=user){origin_detail}"
     return collected, True, origin
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+
+def _position_dict_candidates(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(entry, dict):
+        candidates.append(entry)
+        for key in ("position", "token", "asset", "outcome"):
+            nested = entry.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    return candidates
+
+
+def _position_matches_token(entry: Dict[str, Any], token_id: str) -> bool:
+    token_str = str(token_id)
+    if not token_str:
+        return False
+    id_keys = (
+        "tokenId",
+        "token_id",
+        "clobTokenId",
+        "clob_token_id",
+        "assetId",
+        "asset_id",
+        "outcomeTokenId",
+        "outcome_token_id",
+        "token",
+        "asset",
+        "id",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in id_keys:
+            val = cand.get(key)
+            if val is None:
+                continue
+            if str(val) == token_str:
+                return True
+    return False
+
+
+def _extract_position_size_from_entry(entry: Dict[str, Any]) -> Optional[float]:
+    size_keys = (
+        "size",
+        "positionSize",
+        "position_size",
+        "position",
+        "quantity",
+        "qty",
+        "balance",
+        "amount",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in size_keys:
+            val = _coerce_float(cand.get(key))
+            if val is not None and val > 0:
+                return val
+    return None
+
+
+def _extract_avg_price_from_entry(entry: Dict[str, Any]) -> Optional[float]:
+    avg_keys = (
+        "avg_price",
+        "avgPrice",
+        "average_price",
+        "averagePrice",
+        "avgExecutionPrice",
+        "avg_execution_price",
+        "averageExecutionPrice",
+        "average_execution_price",
+        "entry_price",
+        "entryPrice",
+        "entryAveragePrice",
+        "entry_average_price",
+        "execution_price",
+        "executionPrice",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in avg_keys:
+            val = _coerce_float(cand.get(key))
+            if val is not None and val > 0:
+                return val
+
+    notional_keys = (
+        "total_cost",
+        "totalCost",
+        "net_cost",
+        "netCost",
+        "cost",
+        "position_cost",
+        "positionCost",
+        "purchase_value",
+        "purchaseValue",
+        "buy_value",
+        "buyValue",
+    )
+    size = _extract_position_size_from_entry(entry)
+    if size is None or size <= 0:
+        return None
+    for cand in _position_dict_candidates(entry):
+        for key in notional_keys:
+            notional = _coerce_float(cand.get(key))
+            if notional is None:
+                continue
+            if abs(size) < 1e-12:
+                continue
+            price = notional / size
+            if price > 0:
+                return price
+    return None
+
+
+def _lookup_position_avg_price(
+    client,
+    token_id: str,
+) -> Tuple[Optional[float], Optional[float], str]:
+    if not token_id:
+        return None, None, "token_id 缺失"
+
+    positions, ok, origin = _fetch_positions_from_data_api(client)
+    if not positions:
+        info = origin if origin else ("数据接口返回空列表" if ok else "未知原因")
+        return None, None, info
+
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        if not _position_matches_token(pos, token_id):
+            continue
+        avg_price = _extract_avg_price_from_entry(pos)
+        pos_size = _extract_position_size_from_entry(pos)
+        return avg_price, pos_size, origin
+
+    return None, None, f"未在 {origin or 'positions'} 中找到 token {token_id}"
 
 
 def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
@@ -1474,10 +1727,41 @@ def main():
             filled_amt = float(buy_resp.get("filled") or 0.0)
             avg_price = buy_resp.get("avg_price")
             if filled_amt > 0:
-                fill_px = float(avg_price if avg_price is not None else ref_price)
-                prior_position = position_size or 0.0
-                position_size = prior_position + filled_amt
+                fallback_price = float(avg_price if avg_price is not None else ref_price)
+                prior_position = float(position_size or 0.0)
+                actual_avg_price: Optional[float] = None
+                actual_total_position: Optional[float] = None
+                origin_note = ""
+                try:
+                    actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
+                        client, token_id
+                    )
+                except Exception as exc:
+                    print(
+                        f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
+                    )
+                fill_px = fallback_price
+                if actual_avg_price is not None:
+                    fill_px = actual_avg_price
+                elif origin_note:
+                    print(
+                        f"[WARN] 持仓均价查询失败({origin_note})，沿用下单均价 {fill_px:.4f}。"
+                    )
+                if actual_total_position is not None and actual_total_position > 0:
+                    position_size = actual_total_position
+                else:
+                    position_size = prior_position + filled_amt
                 last_order_size = filled_amt
+                if actual_avg_price is not None:
+                    display_size = (
+                        actual_total_position
+                        if actual_total_position is not None
+                        else position_size
+                    )
+                    origin_display = origin_note or "positions"
+                    print(
+                        f"[STATE] 持仓均价确认 -> origin={origin_display} avg={fill_px:.4f} size={display_size:.4f}"
+                    )
                 buy_filled_kwargs = {
                     "avg_price": fill_px,
                     "size": filled_amt,
