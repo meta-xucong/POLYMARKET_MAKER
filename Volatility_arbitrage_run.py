@@ -518,212 +518,55 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
         return [], False, origin_hint
 
     url = f"{GAMMA_ROOT}/positions"
-    attempt_notes: List[str] = []
 
-    def _pull(param_name: str) -> Tuple[List[dict], bool, str]:
-        limit = 500
-        offset = 0
-        collected: List[dict] = []
-        total_records: Optional[int] = None
+    limit = 500
+    offset = 0
+    collected: List[dict] = []
+    total_records: Optional[int] = None
 
-        while True:
-            params = {param_name: address, "limit": limit, "offset": offset}
+    while True:
+        params = {"user": address, "limit": limit, "offset": offset}
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+        except requests.RequestException as exc:
+            return [], False, f"数据接口请求失败：{exc}"
+
+        if resp.status_code == 404:
+            return [], False, "数据接口返回 404（请确认使用 Proxy/Deposit 地址查询 user 参数）"
+
+        try:
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            return [], False, f"数据接口请求失败：{exc}"
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            return [], False, "数据接口响应解析失败"
+
+        positions = _extract_positions_from_data_api_response(payload)
+        if positions is None:
+            return [], False, "数据接口返回格式异常，缺少 data 字段。"
+
+        collected.extend(positions)
+        meta = payload.get("meta") if isinstance(payload, dict) else {}
+        if isinstance(meta, dict):
+            raw_total = meta.get("total") or meta.get("count")
             try:
-                resp = requests.get(url, params=params, timeout=10)
-            except requests.RequestException as exc:
-                return [], False, f"请求失败：{exc}"
-
-            if resp.status_code == 404:
-                return [], False, "接口返回 404"
-
-            try:
-                resp.raise_for_status()
-            except requests.RequestException as exc:
-                return [], False, f"请求失败：{exc}"
-
-            try:
-                payload = resp.json()
-            except ValueError:
-                return [], False, "响应解析失败"
-
-            positions = _extract_positions_from_data_api_response(payload)
-            if positions is None:
-                return [], False, "数据接口返回格式异常，缺少 data 字段。"
-
-            collected.extend(positions)
-            meta = payload.get("meta") if isinstance(payload, dict) else {}
-            if isinstance(meta, dict):
-                raw_total = meta.get("total") or meta.get("count")
-                try:
-                    if raw_total is not None:
-                        total_records = int(raw_total)
-                except (TypeError, ValueError):
-                    total_records = None
-
-            if not positions or (total_records is not None and len(collected) >= total_records):
-                break
-
-            offset += len(positions)
-
-        total = total_records if total_records is not None else len(collected)
-        origin = f"data-api positions(limit={limit}, total={total}, param={param_name})"
-        return collected, True, origin
-
-    for param_name in ("walletAddress", "address"):
-        positions, ok, detail = _pull(param_name)
-        if ok:
-            fallback = f"；fallback={'; '.join(attempt_notes)}" if attempt_notes else ""
-            origin_detail = f" via {origin_hint}" if origin_hint else ""
-            return positions, True, f"{detail}{origin_detail}{fallback}"
-        attempt_notes.append(f"{param_name}:{detail}")
-
-    failure_detail = "；".join(attempt_notes) if attempt_notes else "未知错误"
-    return [], False, f"数据接口请求失败：{failure_detail}"
-
-
-def _coerce_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        if isinstance(value, str):
-            try:
-                return float(value.strip())
+                if raw_total is not None:
+                    total_records = int(raw_total)
             except (TypeError, ValueError):
-                return None
-        return None
+                total_records = None
 
+        if not positions or (total_records is not None and len(collected) >= total_records):
+            break
 
-def _position_dict_candidates(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
-    candidates: List[Dict[str, Any]] = []
-    if isinstance(entry, dict):
-        candidates.append(entry)
-        for key in ("position", "token", "asset", "outcome"):
-            nested = entry.get(key)
-            if isinstance(nested, dict):
-                candidates.append(nested)
-    return candidates
+        offset += len(positions)
 
-
-def _position_matches_token(entry: Dict[str, Any], token_id: str) -> bool:
-    token_str = str(token_id)
-    if not token_str:
-        return False
-    id_keys = (
-        "tokenId",
-        "token_id",
-        "clobTokenId",
-        "clob_token_id",
-        "assetId",
-        "asset_id",
-        "id",
-    )
-    for cand in _position_dict_candidates(entry):
-        for key in id_keys:
-            val = cand.get(key)
-            if val is None:
-                continue
-            if str(val) == token_str:
-                return True
-    return False
-
-
-def _extract_position_size_from_entry(entry: Dict[str, Any]) -> Optional[float]:
-    size_keys = (
-        "size",
-        "positionSize",
-        "position_size",
-        "position",
-        "quantity",
-        "qty",
-        "balance",
-        "amount",
-    )
-    for cand in _position_dict_candidates(entry):
-        for key in size_keys:
-            val = _coerce_float(cand.get(key))
-            if val is not None and val > 0:
-                return val
-    return None
-
-
-def _extract_avg_price_from_entry(entry: Dict[str, Any]) -> Optional[float]:
-    avg_keys = (
-        "avg_price",
-        "avgPrice",
-        "average_price",
-        "averagePrice",
-        "avgExecutionPrice",
-        "avg_execution_price",
-        "averageExecutionPrice",
-        "average_execution_price",
-        "entry_price",
-        "entryPrice",
-        "entryAveragePrice",
-        "entry_average_price",
-        "execution_price",
-        "executionPrice",
-    )
-    for cand in _position_dict_candidates(entry):
-        for key in avg_keys:
-            val = _coerce_float(cand.get(key))
-            if val is not None and val > 0:
-                return val
-
-    notional_keys = (
-        "total_cost",
-        "totalCost",
-        "net_cost",
-        "netCost",
-        "cost",
-        "position_cost",
-        "positionCost",
-        "purchase_value",
-        "purchaseValue",
-        "buy_value",
-        "buyValue",
-    )
-    size = _extract_position_size_from_entry(entry)
-    if size is None or size <= 0:
-        return None
-    for cand in _position_dict_candidates(entry):
-        for key in notional_keys:
-            notional = _coerce_float(cand.get(key))
-            if notional is None:
-                continue
-            if abs(size) < 1e-12:
-                continue
-            price = notional / size
-            if price > 0:
-                return price
-    return None
-
-
-def _lookup_position_avg_price(
-    client,
-    token_id: str,
-) -> Tuple[Optional[float], Optional[float], str]:
-    if not token_id:
-        return None, None, "token_id 缺失"
-
-    positions, ok, origin = _fetch_positions_from_data_api(client)
-    if not positions:
-        info = origin if origin else ("数据接口返回空列表" if ok else "未知原因")
-        return None, None, info
-
-    for pos in positions:
-        if not isinstance(pos, dict):
-            continue
-        if not _position_matches_token(pos, token_id):
-            continue
-        avg_price = _extract_avg_price_from_entry(pos)
-        pos_size = _extract_position_size_from_entry(pos)
-        return avg_price, pos_size, origin
-
-    return None, None, f"未在 {origin or 'positions'} 中找到 token {token_id}"
+    total = total_records if total_records is not None else len(collected)
+    origin_detail = f" via {origin_hint}" if origin_hint else ""
+    origin = f"data-api positions(limit={limit}, total={total}, param=user){origin_detail}"
+    return collected, True, origin
 
 
 def _coerce_float(value: Any) -> Optional[float]:

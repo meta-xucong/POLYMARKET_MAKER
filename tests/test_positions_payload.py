@@ -97,17 +97,16 @@ def test_fetch_positions_aggregates_pages(monkeypatch):
     assert ok is True
     assert origin.startswith("data-api positions(")
     assert len(positions) == 501
-    assert calls[0][1]["walletAddress"] == "0xabc"
+    assert calls[0][1]["user"] == "0xabc"
     assert calls[0][1]["offset"] == 0
     assert calls[1][1]["offset"] == 500
 
 
-def test_fetch_positions_fallbacks_to_address(monkeypatch):
+def test_fetch_positions_reports_404(monkeypatch):
     module = __import__("Volatility_arbitrage_run")
 
     responses = [
         DummyResponse(404, {}),
-        DummyResponse(200, {"data": [{"asset": "1", "size": "1"}], "meta": {"total": 1}}),
     ]
     calls = []
 
@@ -118,14 +117,12 @@ def test_fetch_positions_fallbacks_to_address(monkeypatch):
     monkeypatch.setattr(module.requests, "get", fake_get)
 
     client = DummyClient(funder="0xabc")
-    positions, ok, origin = _fetch_positions_from_data_api(client)
+    positions, ok, info = _fetch_positions_from_data_api(client)
 
-    assert ok is True
-    assert len(positions) == 1
-    assert calls[0][1]["walletAddress"] == "0xabc"
-    assert calls[1][1]["address"] == "0xabc"
-    assert "param=address" in origin
-    assert "fallback=walletAddress:接口返回 404" in origin
+    assert ok is False
+    assert positions == []
+    assert calls[0][1]["user"] == "0xabc"
+    assert "404" in info
 
 
 def test_fetch_positions_missing_address(monkeypatch):
@@ -170,8 +167,7 @@ def test_fetch_positions_env_fallback(monkeypatch):
     assert positions == []
     assert ok is False
     assert "请求失败" in info
-    assert calls[0]["walletAddress"] == "0xfeed"
-    assert calls[-1].get("address") == "0xfeed"
+    assert calls[0]["user"] == "0xfeed"
 
 
 def test_lookup_position_avg_price_success(monkeypatch):
