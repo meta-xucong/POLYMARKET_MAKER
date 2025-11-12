@@ -506,6 +506,9 @@ def maker_sell_follow_ask_with_floor_wait(
     best_ask_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    sell_mode: str = "conservative",
+    aggressive_step: float = 0.01,
+    aggressive_timeout: float = 120.0,
 ) -> Dict[str, Any]:
     """Maintain a maker sell order while respecting a profit floor."""
 
@@ -538,6 +541,23 @@ def maker_sell_follow_ask_with_floor_wait(
     final_status = "PENDING"
     tick = _order_tick(SELL_PRICE_DP)
 
+    aggressive_mode = str(sell_mode).lower() == "aggressive"
+    aggressive_timer_start: Optional[float] = None
+    aggressive_floor_locked = False
+    aggressive_next_price_override: Optional[float] = None
+    aggressive_locked_price: Optional[float] = None
+    try:
+        aggressive_timeout = float(aggressive_timeout)
+    except (TypeError, ValueError):
+        aggressive_timeout = 120.0
+    try:
+        aggressive_step = float(aggressive_step)
+    except (TypeError, ValueError):
+        aggressive_step = 0.01
+    if aggressive_step <= 0:
+        aggressive_mode = False
+    floor_float = float(floor_X)
+
     while True:
         if stop_check and stop_check():
             if active_order:
@@ -545,6 +565,7 @@ def maker_sell_follow_ask_with_floor_wait(
                 rec = records.get(active_order)
                 if rec is not None:
                     rec["status"] = "CANCELLED"
+                aggressive_timer_start = None
             final_status = "STOPPED"
             break
 
@@ -562,6 +583,8 @@ def maker_sell_follow_ask_with_floor_wait(
                     rec["status"] = "CANCELLED"
                 active_order = None
                 active_price = None
+                aggressive_timer_start = None
+                aggressive_next_price_override = None
             sleep_fn(poll_sec)
             continue
 
@@ -578,6 +601,8 @@ def maker_sell_follow_ask_with_floor_wait(
                     rec["status"] = "CANCELLED"
                 active_order = None
                 active_price = None
+                aggressive_timer_start = None
+                aggressive_next_price_override = None
             sleep_fn(poll_sec)
             continue
 
@@ -585,7 +610,22 @@ def maker_sell_follow_ask_with_floor_wait(
             waiting_for_floor = False
 
         if active_order is None:
-            px = max(_round_down_to_dp(ask, SELL_PRICE_DP), float(floor_X))
+            px_candidate = max(_round_down_to_dp(ask, SELL_PRICE_DP), floor_float)
+            if aggressive_mode:
+                if aggressive_next_price_override is not None:
+                    px_candidate = max(
+                        _round_down_to_dp(aggressive_next_price_override, SELL_PRICE_DP),
+                        floor_float,
+                    )
+                    aggressive_next_price_override = None
+                elif aggressive_locked_price is not None:
+                    px_candidate = max(
+                        _round_down_to_dp(aggressive_locked_price, SELL_PRICE_DP),
+                        floor_float,
+                    )
+            else:
+                aggressive_next_price_override = None
+            px = px_candidate
             qty = _floor_to_dp(remaining, SELL_SIZE_DP)
             if qty < 0.01:
                 final_status = "FILLED"
@@ -645,6 +685,15 @@ def maker_sell_follow_ask_with_floor_wait(
             accounted[order_id] = 0.0
             active_order = order_id
             active_price = px
+            if aggressive_mode:
+                if px <= floor_float + 1e-12:
+                    aggressive_locked_price = px
+                if aggressive_locked_price is not None:
+                    aggressive_floor_locked = True
+                    aggressive_timer_start = None
+                else:
+                    aggressive_floor_locked = False
+                    aggressive_timer_start = time.time()
             print(
                 f"[MAKER][SELL] 挂单 -> price={px:.{SELL_PRICE_DP}f} qty={qty:.{SELL_SIZE_DP}f} remaining={remaining:.{SELL_SIZE_DP}f}"
             )
@@ -705,6 +754,8 @@ def maker_sell_follow_ask_with_floor_wait(
                     rec["status"] = "CANCELLED"
                 active_order = None
                 active_price = None
+                aggressive_timer_start = None
+                aggressive_next_price_override = None
             final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
             break
 
@@ -715,6 +766,8 @@ def maker_sell_follow_ask_with_floor_wait(
                 if rec is not None:
                     rec["status"] = "CANCELLED"
                 active_order = None
+                aggressive_timer_start = None
+                aggressive_next_price_override = None
             final_status = "FILLED"
             break
 
@@ -733,7 +786,53 @@ def maker_sell_follow_ask_with_floor_wait(
             active_order = None
             active_price = None
             waiting_for_floor = True
+            aggressive_timer_start = None
+            aggressive_next_price_override = None
             continue
+
+        if aggressive_mode and active_order and not waiting_for_floor:
+            if active_price is not None and active_price <= floor_float + 1e-12:
+                aggressive_locked_price = active_price
+                aggressive_floor_locked = True
+                aggressive_timer_start = None
+            if not aggressive_floor_locked and active_price is not None:
+                if aggressive_timer_start is None:
+                    aggressive_timer_start = time.time()
+                elapsed = time.time() - aggressive_timer_start
+                if elapsed >= aggressive_timeout:
+                    target_price = active_price - aggressive_step
+                    if target_price >= floor_float - 1e-12:
+                        next_px = max(
+                            _round_down_to_dp(target_price, SELL_PRICE_DP),
+                            floor_float,
+                        )
+                        if next_px >= active_price - 1e-12:
+                            aggressive_timer_start = time.time()
+                            if next_px <= floor_float + 1e-12:
+                                aggressive_locked_price = next_px
+                                aggressive_floor_locked = True
+                                aggressive_timer_start = None
+                        else:
+                            print(
+                                "[MAKER][SELL][激进] 挂单超时未成交，下调挂价 -> "
+                                f"old={active_price:.{SELL_PRICE_DP}f} new={next_px:.{SELL_PRICE_DP}f}"
+                            )
+                            _cancel_order(client, active_order)
+                            rec = records.get(active_order)
+                            if rec is not None:
+                                rec["status"] = "CANCELLED"
+                            active_order = None
+                            active_price = None
+                            aggressive_next_price_override = next_px
+                            aggressive_timer_start = None
+                            if next_px <= floor_float + 1e-12:
+                                aggressive_locked_price = next_px
+                                aggressive_floor_locked = True
+                            continue
+                    else:
+                        aggressive_locked_price = active_price
+                        aggressive_floor_locked = True
+                        aggressive_timer_start = None
 
         if active_price is not None and ask <= active_price - tick - 1e-12:
             new_px = max(_round_down_to_dp(ask, SELL_PRICE_DP), float(floor_X))
@@ -746,6 +845,8 @@ def maker_sell_follow_ask_with_floor_wait(
                 rec["status"] = "CANCELLED"
             active_order = None
             active_price = None
+            aggressive_timer_start = None
+            aggressive_next_price_override = None
             continue
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
@@ -753,10 +854,14 @@ def maker_sell_follow_ask_with_floor_wait(
         if status_text_upper in final_states:
             active_order = None
             active_price = None
+            aggressive_timer_start = None
+            aggressive_next_price_override = None
             continue
         if status_text_upper in cancel_states:
             active_order = None
             active_price = None
+            aggressive_timer_start = None
+            aggressive_next_price_override = None
             continue
 
     avg_price = notional_sum / filled_total if filled_total > 0 else None

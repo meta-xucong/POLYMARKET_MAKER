@@ -760,6 +760,15 @@ def main():
         print("[ERR] 未能获取市场结束时间，程序终止。")
         return
 
+    print("请选择卖出挂单模式：输入 1 为激进分支，输入 2 为保守分支（默认 1）：")
+    sell_mode_in = input().strip()
+    if sell_mode_in == "2":
+        sell_mode = "conservative"
+        print("[INIT] 已选择保守卖出分支。")
+    else:
+        sell_mode = "aggressive"
+        print("[INIT] 已选择激进卖出分支。")
+
     print('请选择方向（YES/NO），回车确认：')
     side = input().strip().upper()
     if side not in ("YES", "NO"):
@@ -1374,6 +1383,7 @@ def main():
                     min_order_size=API_MIN_ORDER_SIZE,
                     best_ask_fn=_latest_best_ask,
                     stop_check=stop_event.is_set,
+                    sell_mode=sell_mode,
                 )
             except Exception as exc:
                 print(f"[ERR] 卖出挂单异常：{exc}")
