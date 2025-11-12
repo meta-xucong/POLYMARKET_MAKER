@@ -97,11 +97,14 @@ def test_fetch_positions_aggregates_pages(monkeypatch):
     assert ok is True
     assert origin.startswith("data-api positions(")
     assert len(positions) == 501
+    assert calls[0][1]["walletAddress"] == "0xabc"
     assert calls[0][1]["offset"] == 0
     assert calls[1][1]["offset"] == 500
 
 
-def test_fetch_positions_missing_address():
+def test_fetch_positions_missing_address(monkeypatch):
+    for env_name in ("POLY_DATA_ADDRESS", "POLY_FUNDER", "POLY_WALLET", "POLY_ADDRESS"):
+        monkeypatch.delenv(env_name, raising=False)
     client = DummyClient()
     positions, ok, info = _fetch_positions_from_data_api(client)
     assert positions == []
@@ -122,6 +125,26 @@ def test_fetch_positions_handles_http_error(monkeypatch):
     assert positions == []
     assert ok is False
     assert "请求失败" in info
+
+
+def test_fetch_positions_env_fallback(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    captured = {}
+
+    def fake_get(url, params=None, timeout=None):
+        captured.update(dict(params or {}))
+        raise module.requests.Timeout("stop after first call")
+
+    monkeypatch.setattr(module.requests, "get", fake_get)
+    monkeypatch.setenv("POLY_FUNDER", "0xfeed")
+
+    client = DummyClient()
+    positions, ok, info = _fetch_positions_from_data_api(client)
+    assert positions == []
+    assert ok is False
+    assert "请求失败" in info
+    assert captured["walletAddress"] == "0xfeed"
 
 
 def test_lookup_position_avg_price_success(monkeypatch):

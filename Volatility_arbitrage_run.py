@@ -420,16 +420,102 @@ def _extract_positions_from_data_api_response(payload: Any) -> Optional[List[dic
     return None
 
 
+def _normalize_wallet_address(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            hexed = value.hex()
+        except Exception:
+            return None
+        return hexed if hexed else None
+    if isinstance(value, str):
+        candidate = value.strip()
+        return candidate or None
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            candidate = _normalize_wallet_address(item)
+            if candidate:
+                return candidate
+        return None
+    if isinstance(value, dict):
+        keys = (
+            "address",
+            "wallet",
+            "walletAddress",
+            "wallet_address",
+            "funder",
+            "owner",
+            "defaultAddress",
+            "default_address",
+        )
+        for key in keys:
+            candidate = _normalize_wallet_address(value.get(key))
+            if candidate:
+                return candidate
+    return None
+
+
+def _resolve_wallet_address(client) -> Tuple[Optional[str], str]:
+    if client is not None:
+        direct_attrs = (
+            "funder",
+            "owner",
+            "address",
+            "wallet",
+            "wallet_address",
+            "walletAddress",
+            "default_address",
+            "defaultAddress",
+            "deposit_address",
+            "depositAddress",
+        )
+        for attr in direct_attrs:
+            try:
+                cand = getattr(client, attr, None)
+            except Exception:
+                continue
+            address = _normalize_wallet_address(cand)
+            if address:
+                return address, f"client.{attr}"
+
+        try:
+            attrs = list(dir(client))
+        except Exception:
+            attrs = []
+        for attr in attrs:
+            if "address" not in attr.lower():
+                continue
+            if attr in direct_attrs:
+                continue
+            try:
+                cand = getattr(client, attr, None)
+            except Exception:
+                continue
+            address = _normalize_wallet_address(cand)
+            if address:
+                return address, f"client.{attr}"
+
+    env_candidates = (
+        "POLY_DATA_ADDRESS",
+        "POLY_FUNDER",
+        "POLY_WALLET",
+        "POLY_ADDRESS",
+    )
+    for env_name in env_candidates:
+        cand = os.getenv(env_name)
+        address = _normalize_wallet_address(cand)
+        if address:
+            return address, f"env:{env_name}"
+
+    return None, "缺少地址，无法从数据接口拉取持仓。"
+
+
 def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
-    address = None
-    for attr in ("funder", "owner", "address", "wallet"):
-        cand = getattr(client, attr, None)
-        if cand:
-            address = cand
-            break
+    address, origin_hint = _resolve_wallet_address(client)
 
     if not address:
-        return [], False, "缺少地址，无法从数据接口拉取持仓。"
+        return [], False, origin_hint
 
     limit = 500
     offset = 0
@@ -439,7 +525,7 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
 
     try:
         while True:
-            params = {"address": address, "limit": limit, "offset": offset}
+            params = {"walletAddress": address, "limit": limit, "offset": offset}
             resp = requests.get(url, params=params, timeout=10)
             resp.raise_for_status()
             payload = resp.json()
@@ -462,7 +548,8 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
         return [], False, f"请求失败：{exc}"
 
     total = total_records if total_records is not None else len(collected)
-    origin = f"data-api positions(limit={limit}, total={total})"
+    origin_detail = f" via {origin_hint}" if origin_hint else ""
+    origin = f"data-api positions(limit={limit}, total={total}){origin_detail}"
     return collected, True, origin
 
 
