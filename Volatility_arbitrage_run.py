@@ -63,7 +63,8 @@ except Exception as e:
     sys.exit(1)
 
 CLOB_API_HOST = "https://clob.polymarket.com"
-GAMMA_ROOT = "https://gamma-api.polymarket.com"
+GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
+DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
 API_MIN_ORDER_SIZE = 5.0
 
 
@@ -517,7 +518,7 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
     if not address:
         return [], False, origin_hint
 
-    url = f"{GAMMA_ROOT}/positions"
+    url = f"{DATA_API_ROOT}/positions"
 
     limit = 500
     offset = 0
