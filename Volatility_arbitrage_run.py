@@ -834,6 +834,14 @@ def main():
         print("[ERR] 盈利百分比非法，退出。")
         return
 
+    print('是否启用“每次卖出后下一轮买入 +1%”功能？（默认开启，输入 no 关闭）：')
+    incremental_in = input().strip().lower()
+    enable_incremental_drop_pct = incremental_in != "no"
+    if enable_incremental_drop_pct:
+        print("[INIT] 已启用卖出后递增买入阈值功能。")
+    else:
+        print("[INIT] 已关闭卖出后递增买入阈值功能。")
+
     sell_only_start_ts: Optional[float] = None
     if market_deadline_ts:
         print(
@@ -881,6 +889,7 @@ def main():
         drop_pct=drop_pct,
         profit_pct=profit_pct,
         disable_sell_signals=True,
+        enable_incremental_drop_pct=enable_incremental_drop_pct,
     )
     strategy = VolArbStrategy(cfg)
     strategy_supports_total_position = _strategy_accepts_total_position(strategy)
