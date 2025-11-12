@@ -1061,7 +1061,7 @@ def main():
             bid, ask, last = _parse_price_change(pc)
             latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask}
             action = strategy.on_tick(best_ask=ask, best_bid=bid, ts=ts)
-            if action and action.action == ActionType.BUY:
+            if action and action.action in (ActionType.BUY, ActionType.SELL):
                 action_queue.put(action)
             if _is_market_closed(pc):
                 print("[MARKET] 检测到市场关闭信号，准备退出…")
@@ -1240,6 +1240,101 @@ def main():
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
 
+    def _execute_sell(
+        order_qty: Optional[float],
+        *,
+        floor_hint: Optional[float],
+        source: str,
+    ) -> None:
+        nonlocal position_size, last_order_size
+
+        def _resolve_order_qty() -> Optional[float]:
+            candidates = [order_qty, position_size, last_order_size]
+            for candidate in candidates:
+                if candidate is None:
+                    continue
+                try:
+                    qty = float(candidate)
+                except (TypeError, ValueError):
+                    continue
+                if qty > 0:
+                    return qty
+            return None
+
+        eff_qty = _resolve_order_qty()
+        if eff_qty is None:
+            print(f"[WARN] {source} 未能确定有效的卖出数量，跳过此次卖出。")
+            strategy.on_reject("invalid sell size")
+            return
+
+        floor_price = floor_hint
+        if floor_price is None:
+            floor_price = strategy.sell_trigger_price()
+
+        if floor_price is None:
+            print(f"[WARN] {source} 无法计算卖出地板价，跳过卖出流程。")
+            strategy.on_reject("missing sell trigger")
+            return
+
+        try:
+            sell_resp = maker_sell_follow_ask_with_floor_wait(
+                client=client,
+                token_id=token_id,
+                position_size=eff_qty,
+                floor_X=float(floor_price),
+                poll_sec=10.0,
+                min_order_size=API_MIN_ORDER_SIZE,
+                best_ask_fn=_latest_best_ask,
+                stop_check=stop_event.is_set,
+                sell_mode=sell_mode,
+            )
+        except Exception as exc:
+            print(f"[ERR] {source} 卖出挂单异常：{exc}")
+            strategy.on_reject(str(exc))
+            return
+
+        print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
+        sell_status = str(sell_resp.get("status") or "").upper()
+        sell_filled = float(sell_resp.get("filled") or 0.0)
+        sell_avg = sell_resp.get("avg_price")
+        eps = 1e-4
+        sell_remaining = float(sell_resp.get("remaining") or 0.0)
+        dust_threshold = (
+            API_MIN_ORDER_SIZE if API_MIN_ORDER_SIZE and API_MIN_ORDER_SIZE > 0 else None
+        )
+        treat_as_dust = False
+        if dust_threshold is not None and sell_remaining > eps:
+            if sell_remaining < dust_threshold - 1e-9:
+                treat_as_dust = True
+        remaining_for_strategy = None if treat_as_dust else sell_remaining
+        strategy.on_sell_filled(
+            avg_price=sell_avg if sell_filled > 0 else None,
+            size=sell_filled if sell_filled > 0 else None,
+            remaining=remaining_for_strategy,
+        )
+        if sell_remaining > eps and not treat_as_dust:
+            position_size = sell_remaining
+            last_order_size = sell_remaining
+            display_price = sell_avg if sell_avg is not None else floor_price
+            print(
+                "[STATE] 卖出部分成交 -> "
+                f"price={display_price:.4f} sold={sell_filled:.4f} remaining={sell_remaining:.4f} status={sell_status}"
+            )
+        else:
+            position_size = None
+            last_order_size = None
+            sold_display = sell_filled if sell_filled > 0 else (eff_qty or 0.0)
+            display_price = sell_avg if sell_avg is not None else floor_price
+            dust_note = ""
+            if treat_as_dust and sell_remaining > eps and dust_threshold is not None:
+                dust_note = (
+                    f" (剩余 {sell_remaining:.4f} < 最小挂单量 {dust_threshold:.2f}，视为完成)"
+                )
+            print(
+                "[STATE] 卖出成交 -> "
+                f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
+            )
+
     try:
         while not stop_event.is_set():
             now = time.time()
@@ -1323,6 +1418,11 @@ def main():
                 stop_event.set()
                 continue
 
+            if action.action == ActionType.SELL:
+                floor_override = action.target_price
+                _execute_sell(position_size, floor_hint=floor_override, source="[SIGNAL]")
+                continue
+
             if action.action != ActionType.BUY:
                 print(f"[WARN] 收到未预期的动作 {action.action}，已忽略。")
                 continue
@@ -1397,68 +1497,7 @@ def main():
             if filled_amt <= 0:
                 continue
 
-            floor_price = strategy.sell_trigger_price()
-            if floor_price is None:
-                print("[WARN] 无法计算卖出地板价，跳过卖出流程。")
-                strategy.on_reject("missing sell trigger")
-                continue
-
-            sell_resp: Dict[str, Any]
-            try:
-                sell_resp = maker_sell_follow_ask_with_floor_wait(
-                    client=client,
-                    token_id=token_id,
-                    position_size=position_size,
-                    floor_X=float(floor_price),
-                    poll_sec=10.0,
-                    min_order_size=API_MIN_ORDER_SIZE,
-                    best_ask_fn=_latest_best_ask,
-                    stop_check=stop_event.is_set,
-                    sell_mode=sell_mode,
-                )
-            except Exception as exc:
-                print(f"[ERR] 卖出挂单异常：{exc}")
-                raise
-
-            print(f"[TRADE][SELL][MAKER] resp={sell_resp}")
-            sell_status = str(sell_resp.get("status") or "").upper()
-            sell_filled = float(sell_resp.get("filled") or 0.0)
-            sell_avg = sell_resp.get("avg_price")
-            eps = 1e-4
-            sell_remaining = float(sell_resp.get("remaining") or 0.0)
-            dust_threshold = API_MIN_ORDER_SIZE if API_MIN_ORDER_SIZE and API_MIN_ORDER_SIZE > 0 else None
-            treat_as_dust = False
-            if dust_threshold is not None and sell_remaining > eps:
-                if sell_remaining < dust_threshold - 1e-9:
-                    treat_as_dust = True
-            remaining_for_strategy = None if treat_as_dust else sell_remaining
-            strategy.on_sell_filled(
-                avg_price=sell_avg if sell_filled > 0 else None,
-                size=sell_filled if sell_filled > 0 else None,
-                remaining=remaining_for_strategy,
-            )
-            if sell_remaining > eps and not treat_as_dust:
-                position_size = sell_remaining
-                last_order_size = sell_remaining
-                display_price = sell_avg if sell_avg is not None else floor_price
-                print(
-                    "[STATE] 卖出部分成交 -> "
-                    f"price={display_price:.4f} sold={sell_filled:.4f} remaining={sell_remaining:.4f} status={sell_status}"
-                )
-            else:
-                position_size = None
-                last_order_size = None
-                sold_display = sell_filled if sell_filled > 0 else filled_amt
-                display_price = sell_avg if sell_avg is not None else floor_price
-                dust_note = ""
-                if treat_as_dust and sell_remaining > eps and dust_threshold is not None:
-                    dust_note = (
-                        f" (剩余 {sell_remaining:.4f} < 最小挂单量 {dust_threshold:.2f}，视为完成)"
-                    )
-                print(
-                    "[STATE] 卖出成交 -> "
-                    f"price={display_price:.4f} size={sold_display:.4f} status={sell_status}{dust_note}"
-                )
+            _execute_sell(position_size, floor_hint=strategy.sell_trigger_price(), source="[POST-BUY]")
 
     except KeyboardInterrupt:
         print("[CMD] 捕获到 Ctrl+C，准备退出…")
