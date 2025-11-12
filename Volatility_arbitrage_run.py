@@ -726,6 +726,151 @@ def _lookup_position_avg_price(
     return None, None, f"未在 {origin or 'positions'} 中找到 token {token_id}"
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except (TypeError, ValueError):
+                return None
+        return None
+
+
+def _position_dict_candidates(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(entry, dict):
+        candidates.append(entry)
+        for key in ("position", "token", "asset", "outcome"):
+            nested = entry.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
+    return candidates
+
+
+def _position_matches_token(entry: Dict[str, Any], token_id: str) -> bool:
+    token_str = str(token_id)
+    if not token_str:
+        return False
+    id_keys = (
+        "tokenId",
+        "token_id",
+        "clobTokenId",
+        "clob_token_id",
+        "assetId",
+        "asset_id",
+        "id",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in id_keys:
+            val = cand.get(key)
+            if val is None:
+                continue
+            if str(val) == token_str:
+                return True
+    return False
+
+
+def _extract_position_size_from_entry(entry: Dict[str, Any]) -> Optional[float]:
+    size_keys = (
+        "size",
+        "positionSize",
+        "position_size",
+        "position",
+        "quantity",
+        "qty",
+        "balance",
+        "amount",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in size_keys:
+            val = _coerce_float(cand.get(key))
+            if val is not None and val > 0:
+                return val
+    return None
+
+
+def _extract_avg_price_from_entry(entry: Dict[str, Any]) -> Optional[float]:
+    avg_keys = (
+        "avg_price",
+        "avgPrice",
+        "average_price",
+        "averagePrice",
+        "avgExecutionPrice",
+        "avg_execution_price",
+        "averageExecutionPrice",
+        "average_execution_price",
+        "entry_price",
+        "entryPrice",
+        "entryAveragePrice",
+        "entry_average_price",
+        "execution_price",
+        "executionPrice",
+    )
+    for cand in _position_dict_candidates(entry):
+        for key in avg_keys:
+            val = _coerce_float(cand.get(key))
+            if val is not None and val > 0:
+                return val
+
+    notional_keys = (
+        "total_cost",
+        "totalCost",
+        "net_cost",
+        "netCost",
+        "cost",
+        "position_cost",
+        "positionCost",
+        "purchase_value",
+        "purchaseValue",
+        "buy_value",
+        "buyValue",
+    )
+    size = _extract_position_size_from_entry(entry)
+    if size is None or size <= 0:
+        return None
+    for cand in _position_dict_candidates(entry):
+        for key in notional_keys:
+            notional = _coerce_float(cand.get(key))
+            if notional is None:
+                continue
+            if abs(size) < 1e-12:
+                continue
+            price = notional / size
+            if price > 0:
+                return price
+    return None
+
+
+def _lookup_position_avg_price(
+    client,
+    token_id: str,
+) -> Tuple[Optional[float], Optional[float], str]:
+    if not token_id:
+        return None, None, "token_id 缺失"
+
+    positions, ok, origin = _fetch_positions_from_data_api(client)
+    if not positions:
+        info = origin if origin else ("数据接口返回空列表" if ok else "未知原因")
+        return None, None, info
+
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        if not _position_matches_token(pos, token_id):
+            continue
+        avg_price = _extract_avg_price_from_entry(pos)
+        pos_size = _extract_position_size_from_entry(pos)
+        return avg_price, pos_size, origin
+
+    return None, None, f"未在 {origin or 'positions'} 中找到 token {token_id}"
+
+
 def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
     market_id = meta.get("market_id") if isinstance(meta, dict) else None
     print(f"[CLAIM] 检测到需处理的未平仓仓位，token_id={token_id}，开始尝试 claim…")
