@@ -608,6 +608,10 @@ def _position_matches_token(entry: Dict[str, Any], token_id: str) -> bool:
         "clob_token_id",
         "assetId",
         "asset_id",
+        "outcomeTokenId",
+        "outcome_token_id",
+        "token",
+        "asset",
         "id",
     )
     for cand in _position_dict_candidates(entry):

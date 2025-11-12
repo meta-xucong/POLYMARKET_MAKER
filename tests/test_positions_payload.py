@@ -174,7 +174,7 @@ def test_lookup_position_avg_price_success(monkeypatch):
     module = __import__("Volatility_arbitrage_run")
 
     sample_positions = [
-        {"tokenId": "123", "avg_price": "0.925", "size": "5"},
+        {"asset": "123", "avg_price": "0.925", "size": "5"},
         {"tokenId": "456", "avg_price": "0.5", "size": "2"},
     ]
 
