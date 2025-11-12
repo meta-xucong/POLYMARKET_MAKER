@@ -526,7 +526,12 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
     total_records: Optional[int] = None
 
     while True:
-        params = {"user": address, "limit": limit, "offset": offset}
+        params = {
+            "user": address,
+            "limit": limit,
+            "offset": offset,
+            "sizeThreshold": 0,
+        }
         try:
             resp = requests.get(url, params=params, timeout=10)
         except requests.RequestException as exc:
@@ -702,21 +707,34 @@ def _lookup_position_avg_price(
     if not token_id:
         return None, None, "token_id 缺失"
 
-    positions, ok, origin = _fetch_positions_from_data_api(client)
-    if not positions:
-        info = origin if origin else ("数据接口返回空列表" if ok else "未知原因")
-        return None, None, info
+    retry_times = 5
+    retry_interval = 1.0
+    last_info: Optional[str] = None
 
-    for pos in positions:
-        if not isinstance(pos, dict):
-            continue
-        if not _position_matches_token(pos, token_id):
-            continue
-        avg_price = _extract_avg_price_from_entry(pos)
-        pos_size = _extract_position_size_from_entry(pos)
-        return avg_price, pos_size, origin
+    for attempt in range(retry_times):
+        positions, ok, origin = _fetch_positions_from_data_api(client)
 
-    return None, None, f"未在 {origin or 'positions'} 中找到 token {token_id}"
+        if positions:
+            for pos in positions:
+                if not isinstance(pos, dict):
+                    continue
+                if not _position_matches_token(pos, token_id):
+                    continue
+                avg_price = _extract_avg_price_from_entry(pos)
+                pos_size = _extract_position_size_from_entry(pos)
+                return avg_price, pos_size, origin
+
+            last_info = f"未在 {origin or 'positions'} 中找到 token {token_id}"
+        else:
+            if ok:
+                last_info = origin if origin else "数据接口返回空列表"
+            else:
+                last_info = origin if origin else "未知原因"
+
+        if attempt < retry_times - 1:
+            time.sleep(retry_interval)
+
+    return None, None, last_info or f"未在 positions 中找到 token {token_id}"
 
 
 def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
