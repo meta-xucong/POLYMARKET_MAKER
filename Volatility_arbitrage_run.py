@@ -584,21 +584,38 @@ def _tokens_from_market_obj(m: dict) -> Tuple[str, str, str]:
         return str(y), str(n), title
     return yes_id, no_id, title
 
+def _looks_like_event_source(source: str) -> bool:
+    """Return True when *source* clearly refers to an event rather than a market."""
+
+    if not isinstance(source, str):
+        return False
+    lower = source.strip().lower()
+    if not lower:
+        return False
+    if "/event/" in lower:
+        return True
+    # 兼容直接输入 event-xxx 这类 slug（旧脚本支持粘贴 slug）。
+    if lower.startswith("event-"):
+        return True
+    return False
+
+
 def _resolve_with_fallback(source: str) -> Tuple[str, str, str, Dict[str, Any]]:
     # 1) "YES_id,NO_id"
     y, n = _parse_yes_no_ids_literal(source)
     if y and n:
         return y, n, "(Manual IDs)", {}
     # 2) 先尝试旧解析器（单一市场 URL/slug）
-    try:
-        y1, n1, title1, raw1 = resolve_token_ids(source)
-        if y1 and n1:
-            meta = _market_meta_from_obj(raw1 or {}) if raw1 else {}
-            if not meta:
-                meta = _maybe_fetch_market_meta_from_source(source)
-            return y1, n1, title1, meta
-    except Exception:
-        pass
+    if not _looks_like_event_source(source):
+        try:
+            y1, n1, title1, raw1 = resolve_token_ids(source)
+            if y1 and n1:
+                meta = _market_meta_from_obj(raw1 or {}) if raw1 else {}
+                if not meta:
+                    meta = _maybe_fetch_market_meta_from_source(source)
+                return y1, n1, title1, meta
+        except Exception:
+            pass
     # 2.5) 若上一步失败：把输入当作可能的 market slug（含 /event 路由别名）
     cand_slugs: List[str] = []
     ms = _extract_market_slug(source)
