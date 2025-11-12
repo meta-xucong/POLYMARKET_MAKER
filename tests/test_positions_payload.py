@@ -1,5 +1,6 @@
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -27,7 +28,11 @@ requests_stub = types.SimpleNamespace(
     get=_default_get,
 )
 
-sys.modules.setdefault("requests", requests_stub)
+sys.modules["requests"] = requests_stub
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 class _WebsocketStub(types.SimpleNamespace):
@@ -35,11 +40,12 @@ class _WebsocketStub(types.SimpleNamespace):
         raise RuntimeError("websocket stub should not be used in tests")
 
 
-sys.modules.setdefault("websocket", _WebsocketStub())
+sys.modules["websocket"] = _WebsocketStub()
 
 from Volatility_arbitrage_run import (
     _extract_positions_from_data_api_response,
     _fetch_positions_from_data_api,
+    _lookup_position_avg_price,
 )
 
 
@@ -116,3 +122,38 @@ def test_fetch_positions_handles_http_error(monkeypatch):
     assert positions == []
     assert ok is False
     assert "请求失败" in info
+
+
+def test_lookup_position_avg_price_success(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    sample_positions = [
+        {"tokenId": "123", "avg_price": "0.925", "size": "5"},
+        {"tokenId": "456", "avg_price": "0.5", "size": "2"},
+    ]
+
+    def fake_fetch(client):
+        return sample_positions, True, "mock-source"
+
+    monkeypatch.setattr(module, "_fetch_positions_from_data_api", fake_fetch)
+
+    avg_price, pos_size, origin = _lookup_position_avg_price(DummyClient(), "123")
+    assert avg_price == 0.925
+    assert pos_size == 5
+    assert origin == "mock-source"
+
+
+def test_lookup_position_avg_price_not_found(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    sample_positions = [{"tokenId": "999", "avg_price": "0.8", "size": "3"}]
+
+    def fake_fetch(client):
+        return sample_positions, True, "mock-origin"
+
+    monkeypatch.setattr(module, "_fetch_positions_from_data_api", fake_fetch)
+
+    avg_price, pos_size, origin = _lookup_position_avg_price(DummyClient(), "123")
+    assert avg_price is None
+    assert pos_size is None
+    assert "123" in origin
