@@ -395,6 +395,10 @@ def maker_buy_follow_bid(
             active_price = px
             if progress_probe:
                 interval = max(progress_probe_interval, poll_sec, 1e-6)
+                try:
+                    progress_probe()
+                except Exception as probe_exc:
+                    print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
                 next_probe_at = time.time() + interval
             print(
                 f"[MAKER][BUY] 挂单 -> price={px:.{BUY_PRICE_DP}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
