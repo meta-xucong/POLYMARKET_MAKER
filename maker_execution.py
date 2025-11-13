@@ -301,6 +301,8 @@ def maker_buy_follow_bid(
     best_bid_fn: Optional[Callable[[], Optional[float]]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    progress_probe: Optional[Callable[[], None]] = None,
+    progress_probe_interval: float = 60.0,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid."""
 
@@ -332,6 +334,8 @@ def maker_buy_follow_bid(
 
     final_status = "PENDING"
     tick = _order_tick(BUY_PRICE_DP)
+
+    next_probe_at = 0.0
 
     while True:
         if stop_check and stop_check():
@@ -389,12 +393,31 @@ def maker_buy_follow_bid(
             accounted[order_id] = 0.0
             active_order = order_id
             active_price = px
+            if progress_probe:
+                interval = max(progress_probe_interval, poll_sec, 1e-6)
+                try:
+                    progress_probe()
+                except Exception as probe_exc:
+                    print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
+                next_probe_at = time.time() + interval
             print(
                 f"[MAKER][BUY] 挂单 -> price={px:.{BUY_PRICE_DP}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
             )
             continue
 
         sleep_fn(poll_sec)
+        if (
+            progress_probe
+            and active_order
+            and progress_probe_interval > 0
+            and time.time() >= max(next_probe_at, 0.0)
+        ):
+            try:
+                progress_probe()
+            except Exception as probe_exc:
+                print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
+            interval = max(progress_probe_interval, poll_sec, 1e-6)
+            next_probe_at = time.time() + interval
         try:
             status_payload = adapter.get_order_status(active_order)
         except Exception as exc:
