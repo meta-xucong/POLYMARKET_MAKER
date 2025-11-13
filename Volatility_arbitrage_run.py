@@ -1724,6 +1724,21 @@ def main():
                 order_size = _calc_size_by_1dollar(ref_price)
                 print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
 
+            def _buy_progress_probe() -> None:
+                try:
+                    avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+                except Exception as probe_exc:
+                    print(f"[WATCHDOG][BUY] 持仓查询异常：{probe_exc}")
+                    return
+                origin_display = origin_note or "positions"
+                if total_pos is None or total_pos <= 0:
+                    print(f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} 当前无持仓")
+                    return
+                avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
+                print(
+                    f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
+                )
+
             try:
                 buy_resp = maker_buy_follow_bid(
                     client=client,
@@ -1734,6 +1749,8 @@ def main():
                     min_order_size=API_MIN_ORDER_SIZE,
                     best_bid_fn=_latest_best_bid,
                     stop_check=stop_event.is_set,
+                    progress_probe=_buy_progress_probe,
+                    progress_probe_interval=60.0,
                 )
             except Exception as exc:
                 print(f"[ERR] 买入下单异常：{exc}")
