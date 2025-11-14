@@ -23,14 +23,8 @@ from queue import Queue, Empty
 from typing import Dict, Any, Tuple, List, Optional
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
-from datetime import datetime, timezone, timedelta
-from json import JSONDecodeError
-try:
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
-    ZoneInfo = None  # type: ignore
-    class ZoneInfoNotFoundError(Exception):
-        pass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from Volatility_arbitrage_strategy import (
     StrategyConfig,
     VolArbStrategy,
@@ -1393,45 +1387,81 @@ def main():
     else:
         print("[INIT] 已关闭卖出后递增买入阈值功能。")
 
-    sell_only_start_ts: Optional[float] = None
+    countdown_raw: Optional[str] = None
     if market_deadline_ts:
         print(
-            "请输入倒计时开始时间（UTC）。"
+            "请输入倒计时开始时间（默认按 UTC 解读，稍后可切换至美东时区）。"
             "可输入：\n"
             "  - 绝对时间，如 2024-01-01 12:30:00 或 ISO8601；\n"
             "  - 提前的分钟数，如输入 30 表示截止前 30 分钟进入仅卖出模式；\n"
             "留空表示不启用倒计时卖出保护。"
         )
-        countdown_in = input().strip()
-        if countdown_in:
-            parsed_ts: Optional[float] = None
-            used_minutes = False
-            if re.search(r"[A-Za-z:/-]", countdown_in):
-                parsed_ts = _parse_timestamp(countdown_in)
-            else:
-                try:
-                    minutes_before = float(countdown_in)
-                    parsed_ts = market_deadline_ts - minutes_before * 60.0
-                    used_minutes = True
-                except Exception:
-                    parsed_ts = _parse_timestamp(countdown_in)
-            if not parsed_ts:
-                print("[ERR] 无法解析倒计时开始时间，程序终止。")
-                return
-            if parsed_ts >= market_deadline_ts:
-                print("[ERR] 倒计时开始时间必须早于市场结束时间，程序终止。")
-                return
-            sell_only_start_ts = parsed_ts
-            if used_minutes:
-                print(
-                    f"[INFO] 倒计时卖出模式将在市场结束前 {countdown_in} 分钟开启。"
-                )
-            else:
-                dt_start = datetime.fromtimestamp(parsed_ts, tz=timezone.utc)
-                print(
-                    "[INFO] 倒计时卖出模式将在 UTC 时间 "
-                    f"{dt_start.isoformat()} 开启。"
-                )
+        countdown_raw = input().strip()
+
+    manual_tz_choice = "utc"
+    effective_deadline_ts = market_deadline_ts
+    et_zone = ZoneInfo("America/New_York")
+    if effective_deadline_ts:
+        print(
+            "请选择市场截止时间的参考时区：\n"
+            "  1) ET（美东，当地自动判断夏令/冬令时）\n"
+            "  2) UTC（默认）"
+        )
+        tz_choice_raw = input().strip().lower()
+        if tz_choice_raw in {"1", "et", "eastern", "美东"}:
+            manual_tz_choice = "et"
+            dt_utc = datetime.fromtimestamp(effective_deadline_ts, tz=timezone.utc)
+            naive = dt_utc.replace(tzinfo=None)
+            dt_et = naive.replace(tzinfo=et_zone)
+            effective_deadline_ts = dt_et.astimezone(timezone.utc).timestamp()
+            print(
+                "[INIT] 已按美东时区重新计算监控截止时间 (UTC)：",
+                f"{datetime.fromtimestamp(effective_deadline_ts, tz=timezone.utc).isoformat()}"
+            )
+        else:
+            print("[INIT] 继续按 UTC 监控截止时间。")
+    market_deadline_ts = effective_deadline_ts
+
+    sell_only_start_ts: Optional[float] = None
+    if countdown_raw and effective_deadline_ts:
+        parsed_ts: Optional[float] = None
+        used_minutes = False
+        if re.search(r"[A-Za-z:/-]", countdown_raw):
+            parsed_ts = _parse_timestamp(countdown_raw)
+        else:
+            try:
+                minutes_before = float(countdown_raw)
+                parsed_ts = effective_deadline_ts - minutes_before * 60.0
+                used_minutes = True
+            except Exception:
+                parsed_ts = _parse_timestamp(countdown_raw)
+        if not parsed_ts:
+            print("[ERR] 无法解析倒计时开始时间，程序终止。")
+            return
+        if parsed_ts >= effective_deadline_ts:
+            print("[ERR] 倒计时开始时间必须早于市场结束时间，程序终止。")
+            return
+        if manual_tz_choice == "et" and not used_minutes:
+            dt_utc = datetime.fromtimestamp(parsed_ts, tz=timezone.utc)
+            naive = dt_utc.replace(tzinfo=None)
+            dt_et = naive.replace(tzinfo=et_zone)
+            parsed_ts = dt_et.astimezone(timezone.utc).timestamp()
+            print("[INFO] 已按美东时区解释倒计时输入。")
+        sell_only_start_ts = parsed_ts
+        if used_minutes:
+            print(
+                f"[INFO] 倒计时卖出模式将在市场结束前 {countdown_raw} 分钟开启。"
+            )
+        else:
+            tz_for_print = timezone.utc
+            tz_label = "UTC"
+            if manual_tz_choice == "et":
+                tz_for_print = et_zone
+                tz_label = "美东 ET"
+            dt_start = datetime.fromtimestamp(parsed_ts, tz=tz_for_print)
+            print(
+                f"[INFO] 倒计时卖出模式将在 {tz_label} 时间 {dt_start.isoformat()} 开启。"
+            )
 
     cfg = StrategyConfig(
         token_id=token_id,
