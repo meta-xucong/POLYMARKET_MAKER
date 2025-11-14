@@ -1394,9 +1394,11 @@ def main():
         print("[INIT] 已关闭卖出后递增买入阈值功能。")
 
     sell_only_start_ts: Optional[float] = None
+    countdown_timezone_hint = tz_hint
     if market_deadline_ts:
+        tz_desc = _describe_timezone_hint(countdown_timezone_hint) or "UTC"
         print(
-            "请输入倒计时开始时间（UTC）。"
+            f"请输入倒计时开始时间（基于 {tz_desc}）。"
             "可输入：\n"
             "  - 绝对时间，如 2024-01-01 12:30:00 或 ISO8601；\n"
             "  - 提前的分钟数，如输入 30 表示截止前 30 分钟进入仅卖出模式；\n"
@@ -1407,14 +1409,16 @@ def main():
             parsed_ts: Optional[float] = None
             used_minutes = False
             if re.search(r"[A-Za-z:/-]", countdown_in):
-                parsed_ts = _parse_timestamp(countdown_in)
+                parsed_ts = _parse_timestamp(countdown_in, countdown_timezone_hint)
             else:
                 try:
                     minutes_before = float(countdown_in)
                     parsed_ts = market_deadline_ts - minutes_before * 60.0
                     used_minutes = True
                 except Exception:
-                    parsed_ts = _parse_timestamp(countdown_in)
+                    parsed_ts = _parse_timestamp(
+                        countdown_in, countdown_timezone_hint
+                    )
             if not parsed_ts:
                 print("[ERR] 无法解析倒计时开始时间，程序终止。")
                 return
