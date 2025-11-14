@@ -225,3 +225,63 @@ def test_maker_sell_invokes_progress_probe():
 
     assert probe_calls, "expected sell progress probe to run at least once"
     assert result["filled"] == pytest.approx(1.0)
+
+
+def test_maker_sell_expands_goal_via_position_fetcher():
+    client = DummyClient(
+        status_sequences=[[{"status": "FILLED", "filledAmount": 3.0, "avgPrice": 0.8}]]
+    )
+    asks = _stream([0.82, 0.82])
+    fetch_calls: List[int] = []
+
+    def _position_fetcher() -> float:
+        fetch_calls.append(len(fetch_calls))
+        return 3.0
+
+    result = maker.maker_sell_follow_ask_with_floor_wait(
+        client,
+        token_id="asset",
+        position_size=1.0,
+        floor_X=0.75,
+        poll_sec=0.0,
+        min_order_size=0.0,
+        best_ask_fn=asks,
+        sleep_fn=lambda _: None,
+        position_fetcher=_position_fetcher,
+        position_refresh_interval=0.0,
+    )
+
+    assert fetch_calls, "expected position fetcher to be invoked"
+    assert client.created_orders, "expected sell order"
+    assert client.created_orders[0]["size"] == pytest.approx(3.0)
+    assert result["filled"] == pytest.approx(3.0)
+
+
+def test_maker_sell_shrinks_goal_and_cancels_active_order():
+    client = DummyClient(
+        status_sequences=[[{"status": "OPEN", "filledAmount": 0.0}]]
+    )
+    asks = _stream([0.9, 0.9])
+    fetch_values = collections.deque([2.0, 0.0])
+
+    def _position_fetcher() -> float:
+        if fetch_values:
+            return fetch_values.popleft()
+        return 0.0
+
+    result = maker.maker_sell_follow_ask_with_floor_wait(
+        client,
+        token_id="asset",
+        position_size=2.0,
+        floor_X=0.85,
+        poll_sec=0.0,
+        min_order_size=0.0,
+        best_ask_fn=asks,
+        sleep_fn=lambda _: None,
+        position_fetcher=_position_fetcher,
+        position_refresh_interval=0.0,
+    )
+
+    assert client.cancelled, "expected active order to be cancelled after shrink"
+    assert result["status"] == "FILLED"
+    assert result["remaining"] == pytest.approx(0.0)

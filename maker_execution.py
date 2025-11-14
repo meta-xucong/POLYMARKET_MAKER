@@ -608,6 +608,8 @@ def maker_sell_follow_ask_with_floor_wait(
     aggressive_timeout: float = 300.0,
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
+    position_fetcher: Optional[Callable[[], Optional[float]]] = None,
+    position_refresh_interval: float = 30.0,
 ) -> Dict[str, Any]:
     """Maintain a maker sell order while respecting a profit floor."""
 
@@ -659,7 +661,15 @@ def maker_sell_follow_ask_with_floor_wait(
         aggressive_mode = False
     floor_float = float(floor_X)
 
+    try:
+        position_refresh_interval = float(position_refresh_interval)
+    except (TypeError, ValueError):
+        position_refresh_interval = 30.0
+    if position_refresh_interval < 0:
+        position_fetcher = None
+
     next_probe_at = 0.0
+    next_position_refresh = 0.0
 
     while True:
         if stop_check and stop_check():
@@ -672,6 +682,59 @@ def maker_sell_follow_ask_with_floor_wait(
                 aggressive_timer_anchor_fill = None
             final_status = "STOPPED"
             break
+
+        now = time.time()
+        if (
+            position_fetcher
+            and now >= max(next_position_refresh, 0.0)
+        ):
+            interval = max(position_refresh_interval, poll_sec, 1e-6)
+            next_position_refresh = now + interval
+            try:
+                live_position = position_fetcher()
+            except Exception as exc:
+                print(f"[MAKER][SELL] 仓位刷新失败：{exc}")
+                live_position = None
+            if live_position is not None:
+                try:
+                    live_target = max(_floor_to_dp(float(live_position), SELL_SIZE_DP), 0.0)
+                except (TypeError, ValueError):
+                    live_target = None
+                if live_target is not None:
+                    min_goal = max(filled_total, 0.0)
+                    new_goal = max(live_target, min_goal)
+                    if abs(new_goal - goal_size) > _MIN_FILL_EPS:
+                        change = "扩充" if new_goal > goal_size else "收缩"
+                        prev_goal = goal_size
+                        goal_size = new_goal
+                        remaining = max(goal_size - filled_total, 0.0)
+                        print(
+                            "[MAKER][SELL] 仓位更新 -> "
+                            f"{change}目标至 {goal_size:.{SELL_SIZE_DP}f}"
+                        )
+                        if remaining <= _MIN_FILL_EPS:
+                            if active_order:
+                                _cancel_order(client, active_order)
+                                rec = records.get(active_order)
+                                if rec is not None:
+                                    rec["status"] = "CANCELLED"
+                                active_order = None
+                                active_price = None
+                            final_status = "FILLED"
+                            break
+                        if new_goal < prev_goal - _MIN_FILL_EPS and active_order:
+                            print("[MAKER][SELL] 仓位降低，撤销当前挂单以调整数量")
+                            _cancel_order(client, active_order)
+                            rec = records.get(active_order)
+                            if rec is not None:
+                                rec["status"] = "CANCELLED"
+                            active_order = None
+                            active_price = None
+                            aggressive_timer_start = None
+                            aggressive_timer_anchor_fill = None
+                            aggressive_next_price_override = None
+                            next_price_override = None
+                            continue
 
         if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
             final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
