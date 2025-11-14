@@ -1390,28 +1390,28 @@ def main():
     else:
         print("[WARN] 市场数据未提供时区信息，默认按 UTC 统计。")
 
-    effective_tz_hint = timezone_override_hint or tz_hint
-    current_tz_desc = _describe_timezone_hint(effective_tz_hint) or "UTC"
-    print(
-        "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
-        f"请输入该描述，直接回车则沿用当前选择的 {current_tz_desc}。"
-    )
-    tz_override_in = input().strip()
-    if tz_override_in:
-        if not _timezone_from_hint(tz_override_in):
-            print("[ERR] 无法识别该时区描述，程序终止。")
-            return
-        timezone_override_hint = tz_override_in
-        market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
-        market_meta = _apply_manual_deadline_override_meta(
-            market_meta,
-            manual_deadline_override_ts,
-        )
-        tz_hint = market_meta.get("timezone_hint")
+    if not tz_hint:
+        current_tz_desc = _describe_timezone_hint(timezone_override_hint) or "UTC"
         print(
-            "[INFO] 已应用手动时区，后续倒计时将参照: "
-            f"{_describe_timezone_hint(tz_hint)}"
+            "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
+            f"请输入该描述，直接回车则沿用当前选择的 {current_tz_desc}。"
         )
+        tz_override_in = input().strip()
+        if tz_override_in:
+            if not _timezone_from_hint(tz_override_in):
+                print("[ERR] 无法识别该时区描述，程序终止。")
+                return
+            timezone_override_hint = tz_override_in
+            market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
+            market_meta = _apply_manual_deadline_override_meta(
+                market_meta,
+                manual_deadline_override_ts,
+            )
+            tz_hint = market_meta.get("timezone_hint")
+            print(
+                "[INFO] 已应用手动时区，后续倒计时将参照: "
+                f"{_describe_timezone_hint(tz_hint)}"
+            )
 
     def _fmt_ts(ts_val: Optional[float]) -> Optional[str]:
         if ts_val is None:
