@@ -117,6 +117,17 @@ def _extract_market_slug(s: str) -> str:
     return ""
 
 
+_TEXT_TIMEZONE_REGEXES = [
+    (re.compile(r"\b(?:u\.s\.|us)?\s*eastern(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/New_York"),
+    (re.compile(r"\b(?:et|est|edt)\b", re.I), "America/New_York"),
+    (re.compile(r"\b(?:u\.s\.|us)?\s*central(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/Chicago"),
+    (re.compile(r"\b(?:ct|cst|cdt)\b", re.I), "America/Chicago"),
+    (re.compile(r"\b(?:u\.s\.|us)?\s*pacific(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/Los_Angeles"),
+    (re.compile(r"\b(?:pt|pst|pdt)\b", re.I), "America/Los_Angeles"),
+    (re.compile(r"\b(?:mountain|mt|mst|mdt)\s+time\b", re.I), "America/Denver"),
+]
+
+
 def _describe_timezone_hint(hint: Any) -> str:
     if hint is None:
         return ""
@@ -205,6 +216,25 @@ def _timezone_from_hint(hint: Any) -> Optional[timezone]:
     return None
 
 
+def _timezone_hint_from_text_block(block: Any) -> Optional[str]:
+    """Parse free-text fields (e.g. rules) to infer well-known timezones."""
+
+    if block is None:
+        return None
+    if isinstance(block, str):
+        lowered = block.lower()
+        for regex, zone in _TEXT_TIMEZONE_REGEXES:
+            if regex.search(lowered):
+                return zone
+        return None
+    if isinstance(block, (list, tuple)):
+        for item in block:
+            hint = _timezone_hint_from_text_block(item)
+            if hint:
+                return hint
+    return None
+
+
 def _infer_timezone_hint(obj: Any) -> Optional[Any]:
     if not isinstance(obj, dict):
         return None
@@ -234,7 +264,25 @@ def _infer_timezone_hint(obj: Any) -> Optional[Any]:
         val = obj.get(key)
         if isinstance(val, (int, float)):
             return {"offset_minutes": float(val)}
-    nested_keys = ("event", "parentMarket", "eventInfo", "collection")
+    text_keys = (
+        "rules",
+        "resolutionRules",
+        "resolutionCriteria",
+        "resolutionDescription",
+        "resolutionSources",
+        "resolutionSource",
+        "description",
+        "details",
+        "notes",
+        "info",
+        "longDescription",
+    )
+    for key in text_keys:
+        hint = _timezone_hint_from_text_block(obj.get(key))
+        if hint:
+            return hint
+
+    nested_keys = ("event", "parentMarket", "eventInfo", "collection", "extraInfo")
     for key in nested_keys:
         nested = obj.get(key)
         if isinstance(nested, dict):
