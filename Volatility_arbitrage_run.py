@@ -73,6 +73,7 @@ CLOB_API_HOST = "https://clob.polymarket.com"
 GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
 DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
 API_MIN_ORDER_SIZE = 5.0
+ORDERBOOK_STALE_AFTER_SEC = 5.0
 
 
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
@@ -1769,7 +1770,7 @@ def main():
             if str(pc.get("asset_id")) != str(token_id):
                 continue
             bid, ask, last = _parse_price_change(pc)
-            latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask}
+            latest[token_id] = {"price": last, "best_bid": bid, "best_ask": ask, "ts": ts}
             action = strategy.on_tick(best_ask=ask, best_bid=bid, ts=ts)
             if action and action.action in (ActionType.BUY, ActionType.SELL):
                 action_queue.put(action)
@@ -1922,8 +1923,22 @@ def main():
             return "-"
         return f"{sec / 60.0:.1f}m"
 
+    def _snapshot_stale(snap: Dict[str, Any]) -> bool:
+        raw_ts = snap.get("ts")
+        if raw_ts is None:
+            return False
+        try:
+            ts_val = float(raw_ts)
+        except (TypeError, ValueError):
+            return False
+        if ts_val > 1e12:
+            ts_val = ts_val / 1000.0
+        return (time.time() - ts_val) > ORDERBOOK_STALE_AFTER_SEC
+
     def _latest_best_bid() -> Optional[float]:
         snap = latest.get(token_id) or {}
+        if _snapshot_stale(snap):
+            return None
         try:
             value = snap.get("best_bid")
             return float(value) if value is not None else None
@@ -1932,6 +1947,8 @@ def main():
 
     def _latest_best_ask() -> Optional[float]:
         snap = latest.get(token_id) or {}
+        if _snapshot_stale(snap):
+            return None
         try:
             value = snap.get("best_ask")
             return float(value) if value is not None else None
@@ -1957,6 +1974,30 @@ def main():
         source: str,
     ) -> None:
         nonlocal position_size, last_order_size
+
+        position_snapshot_cache: Optional[
+            Tuple[Optional[float], Optional[float], Optional[str]]
+        ] = None
+        position_snapshot_ts: float = 0.0
+
+        def _fetch_position_snapshot(*, log_errors: bool, force: bool = False):
+            nonlocal position_snapshot_cache, position_snapshot_ts
+            now = time.time()
+            if (
+                not force
+                and position_snapshot_cache is not None
+                and now - position_snapshot_ts <= 2.0
+            ):
+                return position_snapshot_cache
+            try:
+                snapshot = _lookup_position_avg_price(client, token_id)
+            except Exception as probe_exc:
+                if log_errors:
+                    print(f"[WATCHDOG][SELL] 持仓查询异常：{probe_exc}")
+                return None
+            position_snapshot_cache = snapshot
+            position_snapshot_ts = now
+            return snapshot
 
         def _resolve_order_qty() -> Optional[float]:
             candidates = [order_qty, position_size, last_order_size]
@@ -1987,11 +2028,10 @@ def main():
             return
 
         def _sell_progress_probe() -> None:
-            try:
-                avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
-            except Exception as probe_exc:
-                print(f"[WATCHDOG][SELL] 持仓查询异常：{probe_exc}")
+            snapshot = _fetch_position_snapshot(log_errors=True, force=True)
+            if snapshot is None:
                 return
+            avg_px, total_pos, origin_note = snapshot
             origin_display = origin_note or "positions"
             if total_pos is None or total_pos <= 0:
                 print(f"[WATCHDOG][SELL] 持仓检查 -> origin={origin_display} 当前无持仓")
@@ -2000,6 +2040,13 @@ def main():
             print(
                 f"[WATCHDOG][SELL] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
             )
+
+        def _position_size_fetcher() -> Optional[float]:
+            snapshot = _fetch_position_snapshot(log_errors=False, force=False)
+            if snapshot is None:
+                return None
+            _avg_px, total_pos, _origin = snapshot
+            return total_pos
 
         try:
             sell_resp = maker_sell_follow_ask_with_floor_wait(
@@ -2014,6 +2061,8 @@ def main():
                 sell_mode=sell_mode,
                 progress_probe=_sell_progress_probe,
                 progress_probe_interval=60.0,
+                position_fetcher=_position_size_fetcher,
+                position_refresh_interval=30.0,
             )
         except Exception as exc:
             print(f"[ERR] {source} 卖出挂单异常：{exc}")
