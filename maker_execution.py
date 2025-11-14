@@ -532,6 +532,8 @@ def maker_sell_follow_ask_with_floor_wait(
     sell_mode: str = "conservative",
     aggressive_step: float = 0.01,
     aggressive_timeout: float = 300.0,
+    progress_probe: Optional[Callable[[], None]] = None,
+    progress_probe_interval: float = 60.0,
 ) -> Dict[str, Any]:
     """Maintain a maker sell order while respecting a profit floor."""
 
@@ -582,6 +584,8 @@ def maker_sell_follow_ask_with_floor_wait(
     if aggressive_step <= 0:
         aggressive_mode = False
     floor_float = float(floor_X)
+
+    next_probe_at = 0.0
 
     while True:
         if stop_check and stop_check():
@@ -750,9 +754,28 @@ def maker_sell_follow_ask_with_floor_wait(
             print(
                 f"[MAKER][SELL] 挂单 -> price={px:.{SELL_PRICE_DP}f} qty={qty:.{SELL_SIZE_DP}f} remaining={remaining:.{SELL_SIZE_DP}f}"
             )
+            if progress_probe:
+                interval = max(progress_probe_interval, poll_sec, 1e-6)
+                try:
+                    progress_probe()
+                except Exception as probe_exc:
+                    print(f"[MAKER][SELL] 进度探针执行异常：{probe_exc}")
+                next_probe_at = time.time() + interval
             continue
 
         sleep_fn(poll_sec)
+        if (
+            progress_probe
+            and active_order
+            and progress_probe_interval > 0
+            and time.time() >= max(next_probe_at, 0.0)
+        ):
+            try:
+                progress_probe()
+            except Exception as probe_exc:
+                print(f"[MAKER][SELL] 进度探针执行异常：{probe_exc}")
+            interval = max(progress_probe_interval, poll_sec, 1e-6)
+            next_probe_at = time.time() + interval
         try:
             status_payload = adapter.get_order_status(active_order)
         except Exception as exc:

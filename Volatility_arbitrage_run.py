@@ -1986,6 +1986,21 @@ def main():
             strategy.on_reject("missing sell trigger")
             return
 
+        def _sell_progress_probe() -> None:
+            try:
+                avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+            except Exception as probe_exc:
+                print(f"[WATCHDOG][SELL] 持仓查询异常：{probe_exc}")
+                return
+            origin_display = origin_note or "positions"
+            if total_pos is None or total_pos <= 0:
+                print(f"[WATCHDOG][SELL] 持仓检查 -> origin={origin_display} 当前无持仓")
+                return
+            avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
+            print(
+                f"[WATCHDOG][SELL] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
+            )
+
         try:
             sell_resp = maker_sell_follow_ask_with_floor_wait(
                 client=client,
@@ -1997,6 +2012,8 @@ def main():
                 best_ask_fn=_latest_best_ask,
                 stop_check=stop_event.is_set,
                 sell_mode=sell_mode,
+                progress_probe=_sell_progress_probe,
+                progress_probe_interval=60.0,
             )
         except Exception as exc:
             print(f"[ERR] {source} 卖出挂单异常：{exc}")

@@ -162,3 +162,35 @@ def test_maker_sell_waits_for_floor_before_order():
     assert order["price"] >= 0.70
     assert result["status"] == "FILLED"
     assert result["filled"] == pytest.approx(1.5)
+
+
+def test_maker_sell_invokes_progress_probe():
+    client = DummyClient(
+        status_sequences=[
+            [
+                {"status": "OPEN", "filledAmount": 0.0},
+                {"status": "FILLED", "filledAmount": 1.0, "avgPrice": 0.75},
+            ]
+        ]
+    )
+    asks = _stream([0.80, 0.80])
+    probe_calls: List[int] = []
+
+    def probe() -> None:
+        probe_calls.append(len(probe_calls))
+
+    result = maker.maker_sell_follow_ask_with_floor_wait(
+        client,
+        token_id="asset",
+        position_size=1.0,
+        floor_X=0.70,
+        poll_sec=0.0,
+        min_order_size=0.0,
+        best_ask_fn=asks,
+        sleep_fn=lambda _: None,
+        progress_probe=probe,
+        progress_probe_interval=0.0,
+    )
+
+    assert probe_calls, "expected sell progress probe to run at least once"
+    assert result["filled"] == pytest.approx(1.0)
