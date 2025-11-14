@@ -451,6 +451,23 @@ def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> D
     return meta
 
 
+def _apply_timezone_override_meta(
+    meta: Optional[Dict[str, Any]], override_hint: Optional[Any]
+) -> Dict[str, Any]:
+    """Rebuild meta info with the provided timezone override when possible."""
+
+    base_meta: Dict[str, Any] = dict(meta or {})
+    if not override_hint:
+        return base_meta
+
+    raw_meta = base_meta.get("raw") if isinstance(base_meta, dict) else None
+    if isinstance(raw_meta, dict):
+        return _market_meta_from_obj(raw_meta, override_hint)
+
+    base_meta["timezone_hint"] = override_hint
+    return base_meta
+
+
 def _maybe_fetch_market_meta_from_source(source: str) -> Dict[str, Any]:
     slug = _extract_market_slug(source)
     if not slug:
@@ -1238,6 +1255,20 @@ def _place_sell_fok(client, token_id: str, price: float, size: float) -> Dict[st
     signed = client.create_order(order)
     return client.post_order(signed, OrderType.FOK)
 
+
+def _prompt_timezone_selection() -> Optional[Any]:
+    print("请选择程序使用的时区：输入 1 = ET (美东时间)，输入 2 = UTC：")
+    while True:
+        choice = input().strip()
+        if choice == "1":
+            print("[INIT] 已选择美东 (ET) 时间作为本次运行的基准时区。")
+            return "America/New_York"
+        if choice == "2":
+            print("[INIT] 已选择 UTC 时间作为本次运行的基准时区。")
+            return "UTC"
+        print("[ERR] 请输入 1 或 2 来确认本次使用的时区：")
+
+
 # ===== 主流程 =====
 def main():
     client = _get_client()
@@ -1247,6 +1278,7 @@ def main():
         return
     print("[INIT] API 凭证已验证。")
     print("[INIT] ClobClient 就绪。")
+    timezone_override_hint: Optional[Any] = _prompt_timezone_selection()
     print('请输入 Polymarket 市场 URL，或 "YES_id,NO_id"：')
     source = input().strip()
     if not source:
@@ -1258,7 +1290,7 @@ def main():
         print("[ERR] 无法解析目标：", e)
         return
     market_meta = market_meta or {}
-    timezone_override_hint: Optional[Any] = None
+    market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
     print(f"[INFO] 市场/子问题标题: {title}")
     print(f"[INFO] 解析到 tokenIds: YES={yes_id} | NO={no_id}")
 
@@ -1271,9 +1303,10 @@ def main():
     else:
         print("[WARN] 市场数据未提供时区信息，默认按 UTC 统计。")
 
+    current_tz_desc = _describe_timezone_hint(timezone_override_hint) or "UTC"
     print(
         "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
-        "请输入该描述，留空则沿用自动检测。"
+        f"请输入该描述，直接回车则沿用当前选择的 {current_tz_desc}。"
     )
     tz_override_in = input().strip()
     if tz_override_in:
@@ -1281,12 +1314,7 @@ def main():
             print("[ERR] 无法识别该时区描述，程序终止。")
             return
         timezone_override_hint = tz_override_in
-        raw_meta = market_meta.get("raw") if isinstance(market_meta, dict) else None
-        if isinstance(raw_meta, dict):
-            market_meta = _market_meta_from_obj(raw_meta, timezone_override_hint)
-        else:
-            market_meta = dict(market_meta)
-            market_meta["timezone_hint"] = timezone_override_hint
+        market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
         tz_hint = market_meta.get("timezone_hint")
         print(
             "[INFO] 已应用手动时区，后续倒计时将参照: "
