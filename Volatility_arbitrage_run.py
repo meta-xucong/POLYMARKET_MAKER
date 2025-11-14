@@ -23,7 +23,13 @@ from queue import Queue, Empty
 from typing import Dict, Any, Tuple, List, Optional
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
+    ZoneInfo = None  # type: ignore
+    class ZoneInfoNotFoundError(Exception):
+        pass
 from Volatility_arbitrage_strategy import (
     StrategyConfig,
     VolArbStrategy,
@@ -111,7 +117,134 @@ def _extract_market_slug(s: str) -> str:
     return ""
 
 
-def _parse_timestamp(val: Any) -> Optional[float]:
+def _describe_timezone_hint(hint: Any) -> str:
+    if hint is None:
+        return ""
+    if isinstance(hint, dict) and "offset_minutes" in hint:
+        try:
+            minutes = float(hint["offset_minutes"])
+        except (TypeError, ValueError):
+            return str(hint)
+        sign = "+" if minutes >= 0 else "-"
+        mins = abs(int(minutes))
+        hours, remain = divmod(mins, 60)
+        return f"UTC{sign}{hours:02d}:{remain:02d}"
+    return str(hint)
+
+
+def _timezone_from_hint(hint: Any) -> Optional[timezone]:
+    if hint is None:
+        return None
+    if isinstance(hint, dict) and "offset_minutes" in hint:
+        try:
+            minutes = float(hint["offset_minutes"])
+        except (TypeError, ValueError):
+            return None
+        return timezone(timedelta(minutes=minutes))
+    if isinstance(hint, (int, float)):
+        return timezone(timedelta(minutes=float(hint)))
+
+    text = str(hint).strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    keyword_map = {
+        "et": "America/New_York",
+        "est": "America/New_York",
+        "edt": "America/New_York",
+        "eastern": "America/New_York",
+        "ct": "America/Chicago",
+        "cst": "America/Chicago",
+        "cdt": "America/Chicago",
+        "pt": "America/Los_Angeles",
+        "pst": "America/Los_Angeles",
+        "pdt": "America/Los_Angeles",
+    }
+    canonical = keyword_map.get(lowered)
+    if ZoneInfo and canonical:
+        try:
+            return ZoneInfo(canonical)
+        except ZoneInfoNotFoundError:
+            pass
+    if canonical and not ZoneInfo:
+        # zoneinfo 不可用时退化为标准时区（不考虑夏令时）
+        offsets = {
+            "America/New_York": -300,
+            "America/Chicago": -360,
+            "America/Los_Angeles": -480,
+        }
+        minutes = offsets.get(canonical)
+        if minutes is not None:
+            return timezone(timedelta(minutes=minutes))
+
+    # UTC±HH:MM 或 ±HH:MM
+    m = re.match(r"^(?:utc)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$", lowered)
+    if m:
+        sign = 1 if m.group(1) == "+" else -1
+        hours = int(m.group(2))
+        mins = int(m.group(3) or 0)
+        total = sign * (hours * 60 + mins)
+        return timezone(timedelta(minutes=total))
+
+    # 纯数字：视为分钟
+    if lowered.replace(".", "", 1).lstrip("+-").isdigit():
+        try:
+            value = float(lowered)
+        except ValueError:
+            return None
+        # 数值 <= 24 视为小时，否则视为分钟
+        minutes = value * 60 if abs(value) <= 24 else value
+        return timezone(timedelta(minutes=minutes))
+
+    if ZoneInfo:
+        try:
+            return ZoneInfo(text)
+        except ZoneInfoNotFoundError:
+            return None
+    return None
+
+
+def _infer_timezone_hint(obj: Any) -> Optional[Any]:
+    if not isinstance(obj, dict):
+        return None
+    direct_keys = (
+        "eventTimezone",
+        "event_timezone",
+        "timezone",
+        "timeZone",
+        "marketTimezone",
+        "timezoneName",
+        "timezone_name",
+        "timezoneShort",
+        "timezone_short",
+    )
+    for key in direct_keys:
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    offset_keys = (
+        "timezoneOffsetMinutes",
+        "timezone_offset_minutes",
+        "timezoneOffset",
+        "timezone_offset",
+        "eventTimezoneOffsetMinutes",
+    )
+    for key in offset_keys:
+        val = obj.get(key)
+        if isinstance(val, (int, float)):
+            return {"offset_minutes": float(val)}
+    nested_keys = ("event", "parentMarket", "eventInfo", "collection")
+    for key in nested_keys:
+        nested = obj.get(key)
+        if isinstance(nested, dict):
+            hint = _infer_timezone_hint(nested)
+            if hint:
+                return hint
+    return None
+
+
+def _parse_timestamp(val: Any, timezone_hint: Optional[Any] = None) -> Optional[float]:
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -133,9 +266,11 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         iso = raw.replace("Z", "+00:00")
         try:
             dt = datetime.fromisoformat(iso)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+            tzinfo = dt.tzinfo
+            if tzinfo is None:
+                tzinfo = _timezone_from_hint(timezone_hint) or timezone.utc
+                dt = dt.replace(tzinfo=tzinfo)
+            return dt.astimezone(timezone.utc).timestamp()
         except ValueError:
             pass
         for fmt in (
@@ -146,14 +281,15 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         ):
             try:
                 dt = datetime.strptime(raw, fmt)
-                dt = dt.replace(tzinfo=timezone.utc)
-                return dt.timestamp()
+                tzinfo = _timezone_from_hint(timezone_hint) or timezone.utc
+                dt = dt.replace(tzinfo=tzinfo)
+                return dt.astimezone(timezone.utc).timestamp()
             except ValueError:
                 continue
     return None
 
 
-def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
+def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
     if not isinstance(m, dict):
         return meta
@@ -166,6 +302,10 @@ def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
         or m.get("condition_id")
     )
 
+    tz_hint = timezone_override if timezone_override is not None else _infer_timezone_hint(m)
+    if tz_hint:
+        meta["timezone_hint"] = tz_hint
+
     end_keys = (
         "endDate",
         "endTime",
@@ -176,7 +316,7 @@ def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
         "expirationTime",
     )
     for key in end_keys:
-        ts = _parse_timestamp(m.get(key))
+        ts = _parse_timestamp(m.get(key), tz_hint)
         if ts:
             meta["end_ts"] = ts
             break
@@ -191,7 +331,7 @@ def _market_meta_from_obj(m: dict) -> Dict[str, Any]:
         "settlementTime",
     )
     for key in resolve_keys:
-        ts = _parse_timestamp(m.get(key))
+        ts = _parse_timestamp(m.get(key), tz_hint)
         if ts:
             meta["resolved_ts"] = ts
             break
@@ -1010,8 +1150,40 @@ def main():
         print("[ERR] 无法解析目标：", e)
         return
     market_meta = market_meta or {}
+    timezone_override_hint: Optional[Any] = None
     print(f"[INFO] 市场/子问题标题: {title}")
     print(f"[INFO] 解析到 tokenIds: YES={yes_id} | NO={no_id}")
+
+    tz_hint = market_meta.get("timezone_hint") if isinstance(market_meta, dict) else None
+    if tz_hint:
+        print(
+            "[INFO] 市场标注时区: "
+            f"{_describe_timezone_hint(tz_hint)}"
+        )
+    else:
+        print("[WARN] 市场数据未提供时区信息，默认按 UTC 统计。")
+
+    print(
+        "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
+        "请输入该描述，留空则沿用自动检测。"
+    )
+    tz_override_in = input().strip()
+    if tz_override_in:
+        if not _timezone_from_hint(tz_override_in):
+            print("[ERR] 无法识别该时区描述，程序终止。")
+            return
+        timezone_override_hint = tz_override_in
+        raw_meta = market_meta.get("raw") if isinstance(market_meta, dict) else None
+        if isinstance(raw_meta, dict):
+            market_meta = _market_meta_from_obj(raw_meta, timezone_override_hint)
+        else:
+            market_meta = dict(market_meta)
+            market_meta["timezone_hint"] = timezone_override_hint
+        tz_hint = market_meta.get("timezone_hint")
+        print(
+            "[INFO] 已应用手动时区，后续倒计时将参照: "
+            f"{_describe_timezone_hint(tz_hint)}"
+        )
 
     def _fmt_ts(ts_val: Optional[float]) -> Optional[str]:
         if ts_val is None:
@@ -1195,7 +1367,7 @@ def main():
             return market_meta
         m_obj = _fetch_market_by_slug(slug)
         if isinstance(m_obj, dict):
-            refreshed = _market_meta_from_obj(m_obj)
+            refreshed = _market_meta_from_obj(m_obj, timezone_override_hint)
             if refreshed:
                 market_meta = refreshed
                 new_deadline = _calc_deadline(market_meta)
