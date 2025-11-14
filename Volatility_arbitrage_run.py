@@ -1485,6 +1485,13 @@ def main():
 
     print("请输入买入份数（留空=按 $1 反推）：")
     size_in = input().strip()
+    manual_order_size: Optional[float] = None
+    if size_in:
+        try:
+            manual_order_size = float(size_in)
+        except Exception:
+            print("[ERR] 份数非法，退出。")
+            return
     print("请输入买入触发价（对标 ask，如 0.35，留空表示仅依赖跌幅触发）：")
     buy_px_in = input().strip()
     buy_threshold = None
@@ -1631,6 +1638,15 @@ def main():
             return 1.0
         s = 1.0 / ask_px
         return float(Decimal(str(s)).quantize(Decimal("1"), rounding=ROUND_UP))
+
+    def _probe_position_size_for_buy() -> Tuple[Optional[float], Optional[str]]:
+        try:
+            _avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+        except Exception as probe_exc:
+            print(f"[WATCHDOG][BUY] 下单前持仓查询异常：{probe_exc}")
+            return None, None
+        origin_display = origin_note or "positions"
+        return total_pos, origin_display
 
     def _extract_ts(raw: Optional[Any]) -> float:
         if raw is None:
@@ -2135,14 +2151,30 @@ def main():
                 continue
 
             ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
-            if size_in:
-                try:
-                    order_size = float(size_in)
-                except Exception:
-                    print("[ERR] 份数非法，终止。")
-                    strategy.stop("invalid size")
-                    stop_event.set()
-                    break
+            if manual_order_size is not None:
+                probed_size, origin_display = _probe_position_size_for_buy()
+                current_position = probed_size
+                if current_position is None:
+                    current_position = position_size
+                else:
+                    position_size = current_position
+                owned = max(float(current_position or 0.0), 0.0)
+                remaining_target = max(manual_order_size - owned, 0.0)
+                if remaining_target <= 1e-9:
+                    print(
+                        f"[SKIP][BUY] 当前仓位 {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
+                    )
+                    strategy.on_reject("manual target already satisfied")
+                    continue
+                order_size = remaining_target
+                if origin_display:
+                    print(
+                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位({origin_display}) {owned:.4f} -> 本次下单 {order_size:.4f}"
+                    )
+                else:
+                    print(
+                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位 {owned:.4f} -> 本次下单 {order_size:.4f}"
+                    )
             else:
                 order_size = _calc_size_by_1dollar(ref_price)
                 print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
