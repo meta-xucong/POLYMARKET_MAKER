@@ -24,6 +24,7 @@ from typing import Dict, Any, Tuple, List, Optional
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
 from datetime import datetime, timezone, timedelta
+from json import JSONDecodeError
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 except Exception:  # pragma: no cover - 兼容无 zoneinfo 的环境
@@ -117,6 +118,19 @@ def _extract_market_slug(s: str) -> str:
     return ""
 
 
+_TEXT_TIMEZONE_REGEXES = [
+    (re.compile(r"\b(?:u\.s\.|us)?\s*eastern(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/New_York"),
+    (re.compile(r"\b(?:et|est|edt)\b", re.I), "America/New_York"),
+    (re.compile(r"\b(?:u\.s\.|us)?\s*central(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/Chicago"),
+    (re.compile(r"\b(?:ct|cst|cdt)\b", re.I), "America/Chicago"),
+    (re.compile(r"\b(?:u\.s\.|us)?\s*pacific(?:\s+(?:standard|daylight))?\s+time\b", re.I), "America/Los_Angeles"),
+    (re.compile(r"\b(?:pt|pst|pdt)\b", re.I), "America/Los_Angeles"),
+    (re.compile(r"\b(?:mountain|mt|mst|mdt)\s+time\b", re.I), "America/Denver"),
+]
+
+_JSON_LIKE_PREFIX_RE = re.compile(r"^\s*[\[{]")
+
+
 def _describe_timezone_hint(hint: Any) -> str:
     if hint is None:
         return ""
@@ -205,9 +219,43 @@ def _timezone_from_hint(hint: Any) -> Optional[timezone]:
     return None
 
 
-def _infer_timezone_hint(obj: Any) -> Optional[Any]:
-    if not isinstance(obj, dict):
+def _timezone_hint_from_text_block(block: Any) -> Optional[str]:
+    """Parse free-text fields (e.g. rules) to infer well-known timezones."""
+
+    if block is None:
         return None
+    if isinstance(block, str):
+        lowered = block.lower()
+        for regex, zone in _TEXT_TIMEZONE_REGEXES:
+            if regex.search(lowered):
+                return zone
+        return None
+    if isinstance(block, dict):
+        for value in block.values():
+            hint = _timezone_hint_from_text_block(value)
+            if hint:
+                return hint
+        return None
+    if isinstance(block, (list, tuple)):
+        for item in block:
+            hint = _timezone_hint_from_text_block(item)
+            if hint:
+                return hint
+    return None
+
+
+def _parse_json_like_string(source: Any) -> Optional[Any]:
+    if not isinstance(source, str):
+        return None
+    if not _JSON_LIKE_PREFIX_RE.match(source):
+        return None
+    try:
+        return json.loads(source)
+    except (ValueError, JSONDecodeError, TypeError):
+        return None
+
+
+def _infer_timezone_hint(obj: Any) -> Optional[Any]:
     direct_keys = (
         "eventTimezone",
         "event_timezone",
@@ -219,10 +267,6 @@ def _infer_timezone_hint(obj: Any) -> Optional[Any]:
         "timezoneShort",
         "timezone_short",
     )
-    for key in direct_keys:
-        value = obj.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
     offset_keys = (
         "timezoneOffsetMinutes",
         "timezone_offset_minutes",
@@ -230,18 +274,82 @@ def _infer_timezone_hint(obj: Any) -> Optional[Any]:
         "timezone_offset",
         "eventTimezoneOffsetMinutes",
     )
-    for key in offset_keys:
-        val = obj.get(key)
-        if isinstance(val, (int, float)):
-            return {"offset_minutes": float(val)}
-    nested_keys = ("event", "parentMarket", "eventInfo", "collection")
-    for key in nested_keys:
-        nested = obj.get(key)
-        if isinstance(nested, dict):
-            hint = _infer_timezone_hint(nested)
-            if hint:
-                return hint
-    return None
+    text_keys = (
+        "rules",
+        "resolutionRules",
+        "resolutionCriteria",
+        "resolutionDescription",
+        "resolutionSources",
+        "resolutionSource",
+        "description",
+        "details",
+        "notes",
+        "info",
+        "longDescription",
+        "shortDescription",
+        "question",
+        "title",
+        "subtitle",
+        "body",
+        "text",
+    )
+    nested_keys = (
+        "event",
+        "parentMarket",
+        "eventInfo",
+        "collection",
+        "extraInfo",
+        "metadata",
+        "meta",
+    )
+
+    seen: set[int] = set()
+
+    def _scan(value: Any) -> Optional[Any]:
+        if isinstance(value, dict):
+            oid = id(value)
+            if oid in seen:
+                return None
+            seen.add(oid)
+            for key in direct_keys:
+                val = value.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            for key in offset_keys:
+                val = value.get(key)
+                if isinstance(val, (int, float)):
+                    return {"offset_minutes": float(val)}
+            for key in text_keys:
+                if key in value:
+                    hint = _timezone_hint_from_text_block(value.get(key))
+                    if hint:
+                        return hint
+            for key in nested_keys:
+                if key in value:
+                    hint = _scan(value.get(key))
+                    if hint:
+                        return hint
+            for val in value.values():
+                hint = _scan(val)
+                if hint:
+                    return hint
+            return None
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                hint = _scan(item)
+                if hint:
+                    return hint
+            return None
+        if isinstance(value, str):
+            parsed = _parse_json_like_string(value)
+            if parsed is not None:
+                hint = _scan(parsed)
+                if hint:
+                    return hint
+            return _timezone_hint_from_text_block(value)
+        return None
+
+    return _scan(obj) if isinstance(obj, (dict, list, tuple)) else None
 
 
 def _parse_timestamp(val: Any, timezone_hint: Optional[Any] = None) -> Optional[float]:
