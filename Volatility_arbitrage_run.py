@@ -23,7 +23,7 @@ from queue import Queue, Empty
 from typing import Dict, Any, Tuple, List, Optional
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date, time as dtime
 from json import JSONDecodeError
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -129,6 +129,8 @@ _TEXT_TIMEZONE_REGEXES = [
 ]
 
 _JSON_LIKE_PREFIX_RE = re.compile(r"^\s*[\[{]")
+
+_TIME_COMPONENT_RE = re.compile(r"(\d{1,2}):(\d{2})(?::(\d{2}))?")
 
 
 def _describe_timezone_hint(hint: Any) -> str:
@@ -397,6 +399,97 @@ def _parse_timestamp(val: Any, timezone_hint: Optional[Any] = None) -> Optional[
     return None
 
 
+def _value_has_meaningful_time_component(value: Any) -> bool:
+    if isinstance(value, (int, float)):
+        return True
+    if not isinstance(value, str):
+        return False
+    match = _TIME_COMPONENT_RE.search(value)
+    if not match:
+        return False
+    try:
+        hour = int(match.group(1) or 0)
+        minute = int(match.group(2) or 0)
+        second = int(match.group(3) or 0)
+    except (TypeError, ValueError):
+        return False
+    return not (hour == 0 and minute == 0 and second == 0)
+
+
+def _get_zoneinfo_or_fallback(name: str, fallback_offset_minutes: int) -> timezone:
+    if ZoneInfo:
+        try:
+            return ZoneInfo(name)  # type: ignore[arg-type]
+        except ZoneInfoNotFoundError:
+            pass
+    return timezone(timedelta(minutes=fallback_offset_minutes))
+
+
+def _apply_manual_deadline_override_meta(
+    meta: Optional[Dict[str, Any]], override_ts: Optional[float]
+) -> Dict[str, Any]:
+    base_meta: Dict[str, Any] = dict(meta or {})
+    if not override_ts:
+        return base_meta
+    if base_meta.get("resolved_ts"):
+        return base_meta
+    base_meta["end_ts"] = override_ts
+    base_meta["end_ts_precise"] = True
+    return base_meta
+
+
+def _should_offer_common_deadline_options(meta: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("resolved_ts"):
+        return False
+    end_ts = meta.get("end_ts")
+    if not isinstance(end_ts, (int, float)):
+        return False
+    return not bool(meta.get("end_ts_precise"))
+
+
+def _prompt_common_deadline_override(base_date_utc: date) -> Optional[float]:
+    print(
+        "[WARN] 自动获取的截止时间缺少明确的时区/时刻信息，"
+        "将基于事件标注日期"
+        f" {base_date_utc.isoformat()} 进行人工选择。"
+    )
+    print(
+        "请选择常用结束时间点（默认 1）：\n"
+        "  [1] 12:00 PM ET（金融 / 市场预测类）\n"
+        "  [2] 23:59 ET（天气 / 逐日统计类）\n"
+        "  [3] UTC 00:00（跨时区国际事件）"
+    )
+    options = {
+        "1": {"label": "12:00 PM ET", "hour": 12, "minute": 0, "tz": "America/New_York", "fallback": -240},
+        "2": {"label": "23:59 ET", "hour": 23, "minute": 59, "tz": "America/New_York", "fallback": -240},
+        "3": {"label": "00:00 UTC", "hour": 0, "minute": 0, "tz": "UTC", "fallback": 0},
+    }
+    choice = ""
+    while choice not in options:
+        raw = input().strip()
+        choice = raw or "1"
+        if choice not in options:
+            print("[ERR] 请输入 1、2 或 3：")
+    spec = options[choice]
+    tzinfo = (
+        timezone.utc
+        if spec["tz"] == "UTC"
+        else _get_zoneinfo_or_fallback(spec["tz"], spec["fallback"])
+    )
+    local_dt = datetime.combine(
+        base_date_utc,
+        dtime(hour=spec["hour"], minute=spec["minute"]),
+    ).replace(tzinfo=tzinfo)
+    utc_dt = local_dt.astimezone(timezone.utc)
+    print(
+        "[INFO] 已手动指定该市场监控截止为 "
+        f"{local_dt.isoformat()} ({spec['label']})，即 UTC {utc_dt.isoformat()}。"
+    )
+    return utc_dt.timestamp()
+
+
 def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
     if not isinstance(m, dict):
@@ -424,9 +517,11 @@ def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> D
         "expirationTime",
     )
     for key in end_keys:
-        ts = _parse_timestamp(m.get(key), tz_hint)
+        raw_value = m.get(key)
+        ts = _parse_timestamp(raw_value, tz_hint)
         if ts:
             meta["end_ts"] = ts
+            meta["end_ts_precise"] = _value_has_meaningful_time_component(raw_value)
             break
 
     resolve_keys = (
@@ -1256,19 +1351,6 @@ def _place_sell_fok(client, token_id: str, price: float, size: float) -> Dict[st
     return client.post_order(signed, OrderType.FOK)
 
 
-def _prompt_timezone_selection() -> Optional[Any]:
-    print("请选择程序使用的时区：输入 1 = ET (美东时间)，输入 2 = UTC：")
-    while True:
-        choice = input().strip()
-        if choice == "1":
-            print("[INIT] 已选择美东 (ET) 时间作为本次运行的基准时区。")
-            return "America/New_York"
-        if choice == "2":
-            print("[INIT] 已选择 UTC 时间作为本次运行的基准时区。")
-            return "UTC"
-        print("[ERR] 请输入 1 或 2 来确认本次使用的时区：")
-
-
 # ===== 主流程 =====
 def main():
     client = _get_client()
@@ -1278,7 +1360,8 @@ def main():
         return
     print("[INIT] API 凭证已验证。")
     print("[INIT] ClobClient 就绪。")
-    timezone_override_hint: Optional[Any] = _prompt_timezone_selection()
+    timezone_override_hint: Optional[Any] = None
+    manual_deadline_override_ts: Optional[float] = None
     print('请输入 Polymarket 市场 URL，或 "YES_id,NO_id"：')
     source = input().strip()
     if not source:
@@ -1291,6 +1374,10 @@ def main():
         return
     market_meta = market_meta or {}
     market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
+    market_meta = _apply_manual_deadline_override_meta(
+        market_meta,
+        manual_deadline_override_ts,
+    )
     print(f"[INFO] 市场/子问题标题: {title}")
     print(f"[INFO] 解析到 tokenIds: YES={yes_id} | NO={no_id}")
 
@@ -1303,23 +1390,28 @@ def main():
     else:
         print("[WARN] 市场数据未提供时区信息，默认按 UTC 统计。")
 
-    current_tz_desc = _describe_timezone_hint(timezone_override_hint) or "UTC"
-    print(
-        "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
-        f"请输入该描述，直接回车则沿用当前选择的 {current_tz_desc}。"
-    )
-    tz_override_in = input().strip()
-    if tz_override_in:
-        if not _timezone_from_hint(tz_override_in):
-            print("[ERR] 无法识别该时区描述，程序终止。")
-            return
-        timezone_override_hint = tz_override_in
-        market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
-        tz_hint = market_meta.get("timezone_hint")
+    if not tz_hint:
+        current_tz_desc = _describe_timezone_hint(timezone_override_hint) or "UTC"
         print(
-            "[INFO] 已应用手动时区，后续倒计时将参照: "
-            f"{_describe_timezone_hint(tz_hint)}"
+            "如需手动指定该市场对应的时区（例如 America/New_York、UTC-4、-04:00 或 -240），\n"
+            f"请输入该描述，直接回车则沿用当前选择的 {current_tz_desc}。"
         )
+        tz_override_in = input().strip()
+        if tz_override_in:
+            if not _timezone_from_hint(tz_override_in):
+                print("[ERR] 无法识别该时区描述，程序终止。")
+                return
+            timezone_override_hint = tz_override_in
+            market_meta = _apply_timezone_override_meta(market_meta, timezone_override_hint)
+            market_meta = _apply_manual_deadline_override_meta(
+                market_meta,
+                manual_deadline_override_ts,
+            )
+            tz_hint = market_meta.get("timezone_hint")
+            print(
+                "[INFO] 已应用手动时区，后续倒计时将参照: "
+                f"{_describe_timezone_hint(tz_hint)}"
+            )
 
     def _fmt_ts(ts_val: Optional[float]) -> Optional[str]:
         if ts_val is None:
@@ -1351,6 +1443,20 @@ def main():
         return min(candidates) if candidates else None
 
     market_deadline_ts = _calc_deadline(market_meta)
+    if _should_offer_common_deadline_options(market_meta):
+        base_end_ts = market_meta.get("end_ts")
+        if isinstance(base_end_ts, (int, float)):
+            base_date_utc = datetime.fromtimestamp(
+                float(base_end_ts), tz=timezone.utc
+            ).date()
+            override_ts = _prompt_common_deadline_override(base_date_utc)
+            if override_ts:
+                manual_deadline_override_ts = override_ts
+                market_meta = _apply_manual_deadline_override_meta(
+                    market_meta,
+                    manual_deadline_override_ts,
+                )
+                market_deadline_ts = _calc_deadline(market_meta)
     if market_deadline_ts:
         dt_deadline = datetime.fromtimestamp(market_deadline_ts, tz=timezone.utc)
         print(
@@ -1509,6 +1615,11 @@ def main():
         if isinstance(m_obj, dict):
             refreshed = _market_meta_from_obj(m_obj, timezone_override_hint)
             if refreshed:
+                if manual_deadline_override_ts and not refreshed.get("resolved_ts"):
+                    refreshed = _apply_manual_deadline_override_meta(
+                        refreshed,
+                        manual_deadline_override_ts,
+                    )
                 market_meta = refreshed
                 new_deadline = _calc_deadline(market_meta)
                 if new_deadline:
