@@ -30,7 +30,8 @@ import math
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any, Dict, List, Optional, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from trading.execution import ClobPolymarketAPI
 
@@ -79,10 +80,43 @@ def _coerce_float(value: Any) -> Optional[float]:
     return None
 
 
-def _extract_best_price(payload: Any, side: str) -> Optional[float]:
+class PriceSample(NamedTuple):
+    price: float
+    decimals: Optional[int]
+
+
+def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
+    candidate: Optional[Decimal] = None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            candidate = Decimal(raw)
+        except (InvalidOperation, ValueError):
+            return None
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            candidate = Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+    else:
+        return None
+
+    candidate = candidate.normalize()
+    if candidate.is_zero():
+        return 0
+    exponent = candidate.as_tuple().exponent
+    if exponent >= 0:
+        return 0
+    return min(-int(exponent), max_dp)
+
+
+def _extract_best_price(payload: Any, side: str) -> Optional[PriceSample]:
     numeric = _coerce_float(payload)
     if numeric is not None:
-        return numeric
+        decimals = _infer_price_decimals(payload)
+        return PriceSample(float(numeric), decimals)
 
     if isinstance(payload, Mapping):
         primary_keys = {
@@ -122,9 +156,10 @@ def _extract_best_price(payload: Any, side: str) -> Optional[float]:
                 if isinstance(ladder, Iterable) and not isinstance(ladder, (str, bytes, bytearray)):
                     for entry in ladder:
                         if isinstance(entry, Mapping) and "price" in entry:
+                            decimals = _infer_price_decimals(entry.get("price"))
                             candidate = _coerce_float(entry.get("price"))
                             if candidate is not None:
-                                return candidate
+                                return PriceSample(float(candidate), decimals)
                         extracted = _extract_best_price(entry, side)
                         if extracted is not None:
                             return extracted
@@ -145,7 +180,7 @@ def _extract_best_price(payload: Any, side: str) -> Optional[float]:
     return None
 
 
-def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[float]:
+def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[PriceSample]:
     method_candidates = (
         ("get_market_orderbook", {"market": token_id}),
         ("get_market_orderbook", {"token_id": token_id}),
@@ -181,30 +216,48 @@ def _fetch_best_price(client: Any, token_id: str, side: str) -> Optional[float]:
 
         best = _extract_best_price(payload, side)
         if best is not None:
-            return float(best)
+            return PriceSample(float(best.price), best.decimals)
     return None
 
 
-def _best_bid(client: Any, token_id: str, best_bid_fn: Optional[Callable[[], Optional[float]]]) -> Optional[float]:
-    if best_bid_fn is not None:
+def _best_price_info(
+    client: Any,
+    token_id: str,
+    best_fn: Optional[Callable[[], Optional[float]]],
+    side: str,
+) -> Optional[PriceSample]:
+    if best_fn is not None:
         try:
-            val = best_bid_fn()
+            val = best_fn()
         except Exception:
             val = None
         if val is not None and val > 0:
-            return float(val)
-    return _fetch_best_price(client, token_id, "bid")
+            return PriceSample(float(val), _infer_price_decimals(val))
+    return _fetch_best_price(client, token_id, side)
 
 
-def _best_ask(client: Any, token_id: str, best_ask_fn: Optional[Callable[[], Optional[float]]]) -> Optional[float]:
-    if best_ask_fn is not None:
-        try:
-            val = best_ask_fn()
-        except Exception:
-            val = None
-        if val is not None and val > 0:
-            return float(val)
-    return _fetch_best_price(client, token_id, "ask")
+def _best_bid(
+    client: Any, token_id: str, best_bid_fn: Optional[Callable[[], Optional[float]]]
+) -> Optional[float]:
+    info = _best_price_info(client, token_id, best_bid_fn, "bid")
+    if info is None:
+        return None
+    return info.price
+
+
+def _best_bid_info(
+    client: Any, token_id: str, best_bid_fn: Optional[Callable[[], Optional[float]]]
+) -> Optional[PriceSample]:
+    return _best_price_info(client, token_id, best_bid_fn, "bid")
+
+
+def _best_ask(
+    client: Any, token_id: str, best_ask_fn: Optional[Callable[[], Optional[float]]]
+) -> Optional[float]:
+    info = _best_price_info(client, token_id, best_ask_fn, "ask")
+    if info is None:
+        return None
+    return info.price
 
 
 def _cancel_order(client: Any, order_id: Optional[str]) -> bool:
@@ -303,6 +356,7 @@ def maker_buy_follow_bid(
     sleep_fn: Callable[[float], None] = time.sleep,
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
+    price_dp: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid."""
 
@@ -333,9 +387,21 @@ def maker_buy_follow_bid(
     active_price: Optional[float] = None
 
     final_status = "PENDING"
-    tick = _order_tick(BUY_PRICE_DP)
+    base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
+    price_dp_active = base_price_dp
+    tick = _order_tick(price_dp_active)
 
     next_probe_at = 0.0
+
+    def _maybe_update_price_dp(observed: Optional[int]) -> None:
+        nonlocal price_dp_active, tick
+        if observed is None:
+            return
+        desired = max(base_price_dp, int(observed))
+        if desired != price_dp_active:
+            price_dp_active = desired
+            tick = _order_tick(price_dp_active)
+            print(f"[MAKER][BUY] 检测到市场价格精度 -> decimals={price_dp_active}")
 
     while True:
         if stop_check and stop_check():
@@ -351,11 +417,16 @@ def maker_buy_follow_bid(
             if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
                 final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
                 break
-            bid = _best_bid(client, token_id, best_bid_fn)
-            if bid is None or bid <= 0:
+            bid_info = _best_bid_info(client, token_id, best_bid_fn)
+            if bid_info is None:
                 sleep_fn(poll_sec)
                 continue
-            px = _round_up_to_dp(bid, BUY_PRICE_DP)
+            bid = bid_info.price
+            if bid <= 0:
+                sleep_fn(poll_sec)
+                continue
+            _maybe_update_price_dp(bid_info.decimals)
+            px = _round_up_to_dp(bid, price_dp_active)
             if px <= 0:
                 sleep_fn(poll_sec)
                 continue
@@ -401,7 +472,7 @@ def maker_buy_follow_bid(
                     print(f"[MAKER][BUY] 进度探针执行异常：{probe_exc}")
                 next_probe_at = time.time() + interval
             print(
-                f"[MAKER][BUY] 挂单 -> price={px:.{BUY_PRICE_DP}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
+                f"[MAKER][BUY] 挂单 -> price={px:.{price_dp_active}f} qty={eff_qty:.{BUY_SIZE_DP}f} remaining={remaining:.{BUY_SIZE_DP}f}"
             )
             continue
 
@@ -459,12 +530,15 @@ def maker_buy_follow_bid(
             remaining_slice = max(total_size - filled_amount, 0.0)
             if price_display is not None:
                 print(
-                    f"[MAKER][BUY] 挂单状态 -> price={float(price_display):.{BUY_PRICE_DP}f} "
+                    f"[MAKER][BUY] 挂单状态 -> price={float(price_display):.{price_dp_active}f} "
                     f"filled={filled_amount:.{BUY_SIZE_DP}f} remaining={remaining_slice:.{BUY_SIZE_DP}f} "
                     f"status={status_text_upper}"
                 )
 
-        current_bid = _best_bid(client, token_id, best_bid_fn)
+        current_bid_info = _best_bid_info(client, token_id, best_bid_fn)
+        current_bid = current_bid_info.price if current_bid_info is not None else None
+        if current_bid_info is not None:
+            _maybe_update_price_dp(current_bid_info.decimals)
         min_buyable = 0.0
         if min_quote_amt and min_quote_amt > 0 and current_bid and current_bid > 0:
             min_buyable = _ceil_to_dp(min_quote_amt / max(current_bid, 1e-9), BUY_SIZE_DP)
@@ -486,7 +560,7 @@ def maker_buy_follow_bid(
 
         if current_bid is not None and active_price is not None and current_bid >= active_price + tick - 1e-12:
             print(
-                f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{BUY_PRICE_DP}f} new={current_bid:.{BUY_PRICE_DP}f}"
+                f"[MAKER][BUY] 买一上行 -> 撤单重挂 | old={active_price:.{price_dp_active}f} new={current_bid:.{price_dp_active}f}"
             )
             _cancel_order(client, active_order)
             rec = records.get(active_order)

@@ -140,6 +140,37 @@ def test_maker_buy_handles_missing_fill_amount_on_match():
     assert client.created_orders, "expected order to be created"
 
 
+def test_maker_buy_detects_precision_from_bid_stream():
+    client = DummyClient(
+        status_sequences=[
+            [
+                {"status": "OPEN", "filledAmount": 0.0},
+                {"status": "OPEN", "filledAmount": 0.0},
+            ],
+            [
+                {"status": "FILLED", "filledAmount": 1.0, "avgPrice": 0.984},
+            ],
+        ]
+    )
+    bids = _stream([0.98, 0.984, 0.984])
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=1.0,
+        poll_sec=0.0,
+        min_quote_amt=0.0,
+        min_order_size=0.0,
+        best_bid_fn=bids,
+        sleep_fn=lambda _: None,
+    )
+
+    assert result["filled"] == pytest.approx(1.0)
+    assert len(client.created_orders) >= 2
+    assert client.created_orders[0]["price"] == pytest.approx(0.98, rel=0, abs=1e-9)
+    assert client.created_orders[1]["price"] == pytest.approx(0.984, rel=0, abs=1e-9)
+
+
 def test_maker_sell_waits_for_floor_before_order():
     client = DummyClient(
         status_sequences=[[{"status": "FILLED", "filledAmount": 1.5, "avgPrice": 0.72}]]
