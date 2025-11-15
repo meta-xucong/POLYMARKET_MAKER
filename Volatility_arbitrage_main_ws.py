@@ -197,7 +197,7 @@ if __name__ == "__main__":
     import sys
     src = _parse_cli(sys.argv[1:])
     if not src:
-        print('请输入 Polymarket 市场 URL，或 "YES_id,NO_id"：')
+        print('请输入 Polymarket 市场 URL：')
         src = input().strip()
         if not src:
             raise SystemExit(1)
