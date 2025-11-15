@@ -171,6 +171,33 @@ def test_maker_buy_detects_precision_from_bid_stream():
     assert client.created_orders[1]["price"] == pytest.approx(0.984, rel=0, abs=1e-9)
 
 
+def test_maker_buy_retries_after_invalid_status():
+    client = DummyClient(
+        status_sequences=[
+            [{"status": "INVALID", "filledAmount": 0.0}],
+            [{"status": "FILLED", "filledAmount": 0.2999, "avgPrice": 0.5}],
+        ]
+    )
+    bids = _stream([0.5, 0.5, 0.5])
+
+    result = maker.maker_buy_follow_bid(
+        client,
+        token_id="asset",
+        target_size=0.3,
+        poll_sec=0.0,
+        min_quote_amt=0.0,
+        min_order_size=0.0,
+        best_bid_fn=bids,
+        sleep_fn=lambda _: None,
+    )
+
+    assert result["status"] == "FILLED"
+    assert result["filled"] == pytest.approx(0.2999, rel=0, abs=1e-9)
+    assert len(client.created_orders) == 2
+    assert client.cancelled, "Expected the INVALID order to be cancelled before retry"
+    assert client.created_orders[1]["size"] < client.created_orders[0]["size"]
+
+
 def test_maker_sell_waits_for_floor_before_order():
     client = DummyClient(
         status_sequences=[[{"status": "FILLED", "filledAmount": 1.5, "avgPrice": 0.72}]]
