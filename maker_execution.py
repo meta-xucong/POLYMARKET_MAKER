@@ -390,6 +390,7 @@ def maker_buy_follow_bid(
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
+    size_tick = _order_tick(BUY_SIZE_DP)
 
     next_probe_at = 0.0
 
@@ -572,6 +573,37 @@ def maker_buy_follow_bid(
 
         final_states = {"FILLED", "MATCHED", "COMPLETED", "EXECUTED"}
         cancel_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
+        invalid_states = {"INVALID"}
+        if status_text_upper in invalid_states:
+            print("[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。")
+            if active_order:
+                _cancel_order(client, active_order)
+                rec = records.get(active_order)
+                if rec is not None:
+                    rec["status"] = status_text_upper
+            active_order = None
+            active_price = None
+            current_remaining = max(goal_size - filled_total, 0.0)
+            if current_remaining <= _MIN_FILL_EPS:
+                final_status = "FILLED" if filled_total > _MIN_FILL_EPS else final_status
+                break
+            shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), BUY_SIZE_DP)
+            min_viable = max(min_buyable or 0.0, api_min_qty or 0.0)
+            if shrink_candidate > _MIN_FILL_EPS and (
+                not min_viable or shrink_candidate + _MIN_FILL_EPS >= min_viable
+            ):
+                print(
+                    "[MAKER][BUY] 重新调整买入目标 -> "
+                    f"old={current_remaining:.{BUY_SIZE_DP}f} new={shrink_candidate:.{BUY_SIZE_DP}f}"
+                )
+                goal_size = filled_total + shrink_candidate
+                remaining = max(goal_size - filled_total, 0.0)
+                continue
+            print(
+                "[MAKER][BUY] 无法在满足最小下单量的前提下继续缩减，终止买入。"
+            )
+            final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+            break
         if status_text_upper in final_states:
             active_order = None
             active_price = None
