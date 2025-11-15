@@ -46,6 +46,7 @@ from Volatility_arbitrage_run import (
     _extract_positions_from_data_api_response,
     _fetch_positions_from_data_api,
     _lookup_position_avg_price,
+    _merge_remote_position_size,
 )
 
 
@@ -203,3 +204,21 @@ def test_lookup_position_avg_price_not_found(monkeypatch):
     assert avg_price is None
     assert pos_size is None
     assert "123" in origin
+
+
+def test_merge_remote_position_size_detects_updates():
+    new_size, changed = _merge_remote_position_size(None, 5.0)
+    assert new_size == 5.0
+    assert changed is True
+
+
+def test_merge_remote_position_size_tolerates_noise():
+    new_size, changed = _merge_remote_position_size(5.0, 5.0000004)
+    assert abs((new_size or 0) - 5.0000004) < 1e-9
+    assert changed is False
+
+
+def test_merge_remote_position_size_detects_clear():
+    new_size, changed = _merge_remote_position_size(5.0, 0.0)
+    assert new_size is None
+    assert changed is True
