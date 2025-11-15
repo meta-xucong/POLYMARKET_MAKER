@@ -1434,7 +1434,7 @@ def main():
     print("[INIT] ClobClient 就绪。")
     timezone_override_hint: Optional[Any] = None
     manual_deadline_override_ts: Optional[float] = None
-    print('请输入 Polymarket 市场 URL，或 "YES_id,NO_id"：')
+    print('请输入 Polymarket 市场 URL：')
     source = input().strip()
     if not source:
         print("[ERR] 未输入，退出。")
@@ -1539,23 +1539,30 @@ def main():
         print("[ERR] 未能获取市场结束时间，程序终止。")
         return
 
-    print("请选择卖出挂单模式：输入 1 为激进分支，输入 2 为保守分支（默认 1）：")
-    sell_mode_in = input().strip()
-    if sell_mode_in == "2":
-        sell_mode = "conservative"
-        print("[INIT] 已选择保守卖出分支。")
-    else:
-        sell_mode = "aggressive"
-        print("[INIT] 已选择激进卖出分支。")
+    def _prompt_yes_or_no(message: str, default_yes: bool = True) -> Optional[bool]:
+        print(message)
+        raw = input().strip()
+        if not raw:
+            return default_yes
+        lowered = raw.lower()
+        yes_tokens = {"y", "yes", "1", "true"}
+        no_tokens = {"n", "no", "0", "false"}
+        if lowered in yes_tokens:
+            return True
+        if lowered in no_tokens:
+            return False
+        print("[ERR] 仅接受 y 或 n 输入，退出。")
+        return None
 
-    print('请选择方向（YES/NO），回车确认：')
-    side = input().strip().upper()
-    if side not in ("YES", "NO"):
-        print("[ERR] 方向非法，退出。")
+    side_choice = _prompt_yes_or_no(
+        "① 请选择方向（输入 y 表示做多 YES，输入 n 表示做空 NO，直接回车默认 y）："
+    )
+    if side_choice is None:
         return
+    side = "YES" if side_choice else "NO"
     token_id = yes_id if side == "YES" else no_id
 
-    print("请输入买入份数（留空=按 $1 反推）：")
+    print("② 请输入买入份数（留空=按 $1 反推）：")
     size_in = input().strip()
     manual_order_size: Optional[float] = None
     manual_size_is_target = False
@@ -1568,16 +1575,25 @@ def main():
         if manual_order_size is None or manual_order_size <= 0:
             print("[ERR] 份数必须大于 0，退出。")
             return
-        print(
-            "是否将该份数视为总持仓目标（扣除已有仓位后补足）？"
-            "输入 y 表示是，其它表示按每笔下单量执行："
+        target_choice = _prompt_yes_or_no(
+            "③ 是否将该份数视为总持仓目标（扣除已有仓位后补足）？输入 y 表示是，输入 n 表示按单笔下单量执行（默认 y）："
         )
-        target_mode_in = input().strip().lower()
-        manual_size_is_target = target_mode_in in {"y", "yes", "1", "true"}
+        if target_choice is None:
+            return
+        manual_size_is_target = target_choice
         if manual_size_is_target:
             print("[INIT] 手动份数将作为总目标使用，买入时会扣除当前仓位。")
         else:
             print("[INIT] 手动份数将直接作为单笔下单量使用，不扣除已有仓位。")
+
+    print("④ 请选择卖出挂单模式：输入 1 为激进分支，输入 2 为保守分支（默认 1）：")
+    sell_mode_in = input().strip()
+    if sell_mode_in == "2":
+        sell_mode = "conservative"
+        print("[INIT] 已选择保守卖出分支。")
+    else:
+        sell_mode = "aggressive"
+        print("[INIT] 已选择激进卖出分支。")
     print("请输入买入触发价（对标 ask，如 0.35，留空表示仅依赖跌幅触发）：")
     buy_px_in = input().strip()
     buy_threshold = None
@@ -1612,9 +1628,12 @@ def main():
         print("[ERR] 盈利百分比非法，退出。")
         return
 
-    print('是否启用“每次卖出后下一轮买入 +1%”功能？（默认开启，输入 no 关闭）：')
-    incremental_in = input().strip().lower()
-    enable_incremental_drop_pct = incremental_in != "no"
+    incremental_choice = _prompt_yes_or_no(
+        '是否启用“每次卖出后下一轮买入 +1%”功能？输入 y 表示开启，输入 n 表示关闭（默认 y）：'
+    )
+    if incremental_choice is None:
+        return
+    enable_incremental_drop_pct = incremental_choice
     if enable_incremental_drop_pct:
         print("[INIT] 已启用卖出后递增买入阈值功能。")
     else:
