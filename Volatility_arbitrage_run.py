@@ -74,6 +74,7 @@ GAMMA_ROOT = os.getenv("POLY_GAMMA_ROOT", "https://gamma-api.polymarket.com")
 DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com")
 API_MIN_ORDER_SIZE = 5.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
+POSITION_SYNC_INTERVAL = 60.0
 
 
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
@@ -605,6 +606,40 @@ def _extract_position_size(status: Dict[str, Any]) -> float:
     return 0.0
 
 
+def _merge_remote_position_size(
+    current_size: Optional[float],
+    remote_size: Optional[float],
+    *,
+    eps: float = 1e-6,
+) -> Tuple[Optional[float], bool]:
+    """Return normalized remote size and whether it differs from the current state."""
+
+    def _normalize(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            normalized = float(value)
+        except (TypeError, ValueError):
+            return None
+        if normalized <= eps:
+            return None
+        return normalized
+
+    current_norm = _normalize(current_size)
+    remote_norm = _normalize(remote_size)
+
+    if current_norm is None and remote_norm is None:
+        return None, False
+    if current_norm is None and remote_norm is not None:
+        return remote_norm, True
+    if current_norm is not None and remote_norm is None:
+        return None, True
+    assert current_norm is not None and remote_norm is not None
+    if abs(current_norm - remote_norm) > eps:
+        return remote_norm, True
+    return remote_norm, False
+
+
 def _should_attempt_claim(
     meta: Dict[str, Any],
     status: Dict[str, Any],
@@ -1007,6 +1042,42 @@ def _extract_position_size_from_entry(entry: Dict[str, Any]) -> Optional[float]:
             if val is not None and val > 0:
                 return val
     return None
+
+
+def _plan_manual_buy_size(
+    manual_size: Optional[float],
+    owned_size: Optional[float],
+    *,
+    enforce_target: bool,
+    eps: float = 1e-9,
+) -> Tuple[Optional[float], bool]:
+    """Compute the effective order size for manual buy mode."""
+
+    if manual_size is None:
+        return None, False
+
+    try:
+        requested = float(manual_size)
+    except (TypeError, ValueError):
+        return None, False
+
+    if requested <= 0:
+        return None, True
+
+    current_owned = 0.0
+    if owned_size is not None:
+        try:
+            current_owned = max(float(owned_size), 0.0)
+        except (TypeError, ValueError):
+            current_owned = 0.0
+
+    if not enforce_target:
+        return requested, False
+
+    remaining = max(requested - current_owned, 0.0)
+    if remaining <= eps:
+        return None, True
+    return remaining, False
 
 
 def _extract_avg_price_from_entry(entry: Dict[str, Any]) -> Optional[float]:
@@ -1487,12 +1558,26 @@ def main():
     print("请输入买入份数（留空=按 $1 反推）：")
     size_in = input().strip()
     manual_order_size: Optional[float] = None
+    manual_size_is_target = False
     if size_in:
         try:
             manual_order_size = float(size_in)
         except Exception:
             print("[ERR] 份数非法，退出。")
             return
+        if manual_order_size is None or manual_order_size <= 0:
+            print("[ERR] 份数必须大于 0，退出。")
+            return
+        print(
+            "是否将该份数视为总持仓目标（扣除已有仓位后补足）？"
+            "输入 y 表示是，其它表示按每笔下单量执行："
+        )
+        target_mode_in = input().strip().lower()
+        manual_size_is_target = target_mode_in in {"y", "yes", "1", "true"}
+        if manual_size_is_target:
+            print("[INIT] 手动份数将作为总目标使用，买入时会扣除当前仓位。")
+        else:
+            print("[INIT] 手动份数将直接作为单笔下单量使用，不扣除已有仓位。")
     print("请输入买入触发价（对标 ask，如 0.35，留空表示仅依赖跌幅触发）：")
     buy_px_in = input().strip()
     buy_threshold = None
@@ -1966,6 +2051,33 @@ def main():
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
+    next_position_sync: float = 0.0
+
+    def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
+        nonlocal position_size, next_position_sync
+        now = time.time()
+        if not force and now < next_position_sync:
+            return
+        next_position_sync = now + POSITION_SYNC_INTERVAL
+        try:
+            avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+        except Exception as probe_exc:
+            print(f"[WATCHDOG][POSITION] {reason} 持仓查询异常：{probe_exc}")
+            return
+        new_size, changed = _merge_remote_position_size(position_size, total_pos)
+        if not changed:
+            return
+        position_size = new_size
+        origin_display = origin_note or "positions"
+        avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
+        if new_size is None:
+            print(
+                f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} 当前无持仓"
+            )
+        else:
+            print(
+                f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} size={new_size:.4f}"
+            )
 
     def _execute_sell(
         order_qty: Optional[float],
@@ -2124,6 +2236,9 @@ def main():
                     action_queue.put(pending_buy)
                     pending_buy = None
 
+            if now >= next_position_sync:
+                _maybe_refresh_position_size("[LOOP]")
+
             if last_log is None or now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
                 bid = float(snap.get("best_bid") or 0.0)
@@ -2225,22 +2340,35 @@ def main():
                 else:
                     position_size = current_position
                 owned = max(float(current_position or 0.0), 0.0)
-                remaining_target = max(manual_order_size - owned, 0.0)
-                if remaining_target <= 1e-9:
+                planned_size, skip_manual = _plan_manual_buy_size(
+                    manual_order_size,
+                    owned,
+                    enforce_target=manual_size_is_target,
+                )
+                if skip_manual:
+                    origin_note = origin_display or "positions"
                     print(
-                        f"[SKIP][BUY] 当前仓位 {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
+                        f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
                     )
                     strategy.on_reject("manual target already satisfied")
                     continue
-                order_size = remaining_target
-                if origin_display:
+                if planned_size is None or planned_size <= 0:
+                    print("[WARN] 手动份数解析异常，跳过本次买入。")
+                    strategy.on_reject("invalid manual size")
+                    continue
+                order_size = planned_size
+                origin_hint = f"({origin_display})" if origin_display else ""
+                if manual_size_is_target:
                     print(
-                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位({origin_display}) {owned:.4f} -> 本次下单 {order_size:.4f}"
+                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位{origin_hint} {owned:.4f} -> 本次下单 {order_size:.4f}"
                     )
                 else:
-                    print(
-                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位 {owned:.4f} -> 本次下单 {order_size:.4f}"
-                    )
+                    if owned > 0:
+                        print(
+                            f"[HINT][BUY] 当前仓位{origin_hint} {owned:.4f}，但按手动份数 {order_size:.4f} 下单。"
+                        )
+                    else:
+                        print(f"[HINT][BUY] 手动份数 -> 本次下单 {order_size:.4f}")
             else:
                 order_size = _calc_size_by_1dollar(ref_price)
                 print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
