@@ -47,6 +47,9 @@ class StrategyConfig:
     min_price: Optional[float] = 0.0
     max_price: Optional[float] = 1.0
 
+    # 交易所最小市场单规模（用于识别“尘埃仓位”并视为已清空）
+    min_market_order_size: Optional[float] = None
+
 
 @dataclass
 class Action:
@@ -111,6 +114,11 @@ class VolArbStrategy:
         # 记录跌幅阈值的初始值（用于动态递增的下限）
         self._initial_drop_pct: float = max(self.cfg.drop_pct, 0.0)
 
+        # 最小可交易规模（用于卖出回调时识别尘埃仓位）
+        self._min_market_order_size: Optional[float] = self._normalize_min_market_order_size(
+            getattr(self.cfg, "min_market_order_size", None)
+        )
+
     # ------------------------ 上游主调用：每笔行情快照 ------------------------
     def on_tick(
         self,
@@ -133,6 +141,8 @@ class VolArbStrategy:
         self._last_tick_ts = ts
         self._last_best_ask = best_ask
         self._last_best_bid = best_bid
+
+        self._maybe_reconcile_dust_position()
 
         price_for_drop = self._prepare_price_history(ts, (best_bid + best_ask) / 2)
 
@@ -408,21 +418,23 @@ class VolArbStrategy:
             except (TypeError, ValueError):
                 remaining_size = None
 
-        if remaining_size is not None and remaining_size <= eps:
-            remaining_size = None
+        if remaining_size is not None:
+            min_order_size = self._min_market_order_size
+            dust_floor = eps
+            if min_order_size is not None:
+                dust_floor = max(min_order_size, dust_floor)
+            if remaining_size <= dust_floor:
+                remaining_size = None
 
         if remaining_size is None:
             self._state = "FLAT"
             self._entry_price = None
             self._position_size = None
-            if self._awaiting == ActionType.SELL:
-                self._awaiting = None
+            self._awaiting = None
         else:
             self._position_size = remaining_size
-            if self._awaiting == ActionType.SELL:
-                # 仍有仓位未卖完，解除等待以便继续发 SELL 信号
-                self._awaiting = None
             self._state = "LONG"
+            self._awaiting = ActionType.SELL
 
         if remaining_size is None and self._awaiting is not None:
             # 清理非 SELL 的等待状态，确保重新触发买入
@@ -478,6 +490,7 @@ class VolArbStrategy:
         enable_incremental_drop_pct: Optional[bool] = None,
         incremental_drop_pct_step: Optional[float] = None,
         incremental_drop_pct_cap: Optional[float] = None,
+        min_market_order_size: Optional[float] = None,
     ) -> None:
         if buy_price_threshold is not None:
             self.cfg.buy_price_threshold = buy_price_threshold
@@ -505,6 +518,11 @@ class VolArbStrategy:
             self.cfg.incremental_drop_pct_step = float(incremental_drop_pct_step)
         if incremental_drop_pct_cap is not None:
             self.cfg.incremental_drop_pct_cap = float(incremental_drop_pct_cap)
+        if min_market_order_size is not None:
+            self.cfg.min_market_order_size = min_market_order_size
+            self._min_market_order_size = self._normalize_min_market_order_size(
+                min_market_order_size
+            )
 
     def sell_trigger_price(self) -> Optional[float]:
         if self._entry_price is None:
@@ -553,6 +571,7 @@ class VolArbStrategy:
                 "enable_incremental_drop_pct": self.cfg.enable_incremental_drop_pct,
                 "incremental_drop_pct_step": self.cfg.incremental_drop_pct_step,
                 "incremental_drop_pct_cap": self.cfg.incremental_drop_pct_cap,
+                "min_market_order_size": self._min_market_order_size,
             },
         }
 
@@ -572,3 +591,38 @@ class VolArbStrategy:
         else:
             new_drop = current + step
         self.cfg.drop_pct = new_drop
+
+    def _maybe_reconcile_dust_position(self) -> None:
+        """If current持仓低于最小可交易量，则将状态重置为空仓。"""
+
+        if self._state != "LONG":
+            return
+        if self._position_size is None:
+            return
+
+        min_order = self._min_market_order_size
+        if min_order is None:
+            return
+
+        dust_floor = max(min_order, 1e-4)
+        try:
+            size = float(self._position_size)
+        except (TypeError, ValueError):
+            return
+
+        if size <= dust_floor:
+            self._state = "FLAT"
+            self._position_size = None
+            self._entry_price = None
+            if self._awaiting != ActionType.BUY:
+                self._awaiting = None
+
+    @staticmethod
+    def _normalize_min_market_order_size(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if numeric > 0 else None
