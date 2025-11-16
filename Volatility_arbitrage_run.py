@@ -451,7 +451,9 @@ def _should_offer_common_deadline_options(meta: Optional[Dict[str, Any]]) -> boo
     return not bool(meta.get("end_ts_precise"))
 
 
-def _prompt_common_deadline_override(base_date_utc: date) -> Optional[float]:
+def _prompt_common_deadline_override(
+    base_date_utc: date,
+) -> Tuple[Optional[float], bool]:
     print(
         "[WARN] 自动获取的截止时间缺少明确的时区/时刻信息，"
         "将基于事件标注日期"
@@ -461,20 +463,25 @@ def _prompt_common_deadline_override(base_date_utc: date) -> Optional[float]:
         "请选择常用结束时间点（默认 1）：\n"
         "  [1] 12:00 PM ET（金融 / 市场预测类）\n"
         "  [2] 23:59 ET（天气 / 逐日统计类）\n"
-        "  [3] UTC 00:00（跨时区国际事件）"
+        "  [3] UTC 00:00（跨时区国际事件）\n"
+        "  [4] 不设定结束时间点"
     )
     options = {
         "1": {"label": "12:00 PM ET", "hour": 12, "minute": 0, "tz": "America/New_York", "fallback": -240},
         "2": {"label": "23:59 ET", "hour": 23, "minute": 59, "tz": "America/New_York", "fallback": -240},
         "3": {"label": "00:00 UTC", "hour": 0, "minute": 0, "tz": "UTC", "fallback": 0},
+        "4": {"label": "不设定结束时间点", "no_deadline": True},
     }
     choice = ""
     while choice not in options:
         raw = input().strip()
         choice = raw or "1"
         if choice not in options:
-            print("[ERR] 请输入 1、2 或 3：")
+            print("[ERR] 请输入 1、2、3 或 4：")
     spec = options[choice]
+    if spec.get("no_deadline"):
+        print("[INFO] 已选择不设定结束时间点，将跳过截止时间校验与倒计时。")
+        return None, True
     tzinfo = (
         timezone.utc
         if spec["tz"] == "UTC"
@@ -489,7 +496,7 @@ def _prompt_common_deadline_override(base_date_utc: date) -> Optional[float]:
         "[INFO] 已手动指定该市场监控截止为 "
         f"{local_dt.isoformat()} ({spec['label']})，即 UTC {utc_dt.isoformat()}。"
     )
-    return utc_dt.timestamp()
+    return utc_dt.timestamp(), False
 
 
 def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> Dict[str, Any]:
@@ -1434,6 +1441,7 @@ def main():
     print("[INIT] ClobClient 就绪。")
     timezone_override_hint: Optional[Any] = None
     manual_deadline_override_ts: Optional[float] = None
+    manual_deadline_disabled = False
     print('请输入 Polymarket 市场 URL：')
     source = input().strip()
     if not source:
@@ -1521,20 +1529,30 @@ def main():
             base_date_utc = datetime.fromtimestamp(
                 float(base_end_ts), tz=timezone.utc
             ).date()
-            override_ts = _prompt_common_deadline_override(base_date_utc)
-            if override_ts:
+            override_ts, deadline_disabled = _prompt_common_deadline_override(
+                base_date_utc
+            )
+            manual_deadline_disabled = deadline_disabled
+            if override_ts is not None:
                 manual_deadline_override_ts = override_ts
                 market_meta = _apply_manual_deadline_override_meta(
                     market_meta,
                     manual_deadline_override_ts,
                 )
                 market_deadline_ts = _calc_deadline(market_meta)
+            if manual_deadline_disabled:
+                market_meta = dict(market_meta or {})
+                market_meta.pop("end_ts", None)
+                market_meta.pop("resolved_ts", None)
+                market_deadline_ts = None
     if market_deadline_ts:
         dt_deadline = datetime.fromtimestamp(market_deadline_ts, tz=timezone.utc)
         print(
             "[INFO] 监控目标结束时间 (UTC): "
             f"{dt_deadline.isoformat()}"
         )
+    elif manual_deadline_disabled:
+        print("[WARN] 未设定结束时间点：跳过截止时间校验和倒计时。")
     else:
         print("[ERR] 未能获取市场结束时间，程序终止。")
         return
@@ -1732,10 +1750,16 @@ def main():
                         refreshed,
                         manual_deadline_override_ts,
                     )
+                if manual_deadline_disabled:
+                    refreshed = dict(refreshed)
+                    refreshed.pop("end_ts", None)
+                    refreshed.pop("resolved_ts", None)
+                    market_deadline_ts = None
+                else:
+                    new_deadline = _calc_deadline(refreshed)
+                    if new_deadline:
+                        market_deadline_ts = new_deadline
                 market_meta = refreshed
-                new_deadline = _calc_deadline(market_meta)
-                if new_deadline:
-                    market_deadline_ts = new_deadline
         return market_meta
 
     def _calc_size_by_1dollar(ask_px: float) -> float:
@@ -2357,7 +2381,8 @@ def main():
             ask = float(snap.get("best_ask") or 0.0)
 
             if (
-                not market_closed_detected
+                not manual_deadline_disabled
+                and not market_closed_detected
                 and market_meta
                 and _market_has_ended(market_meta, now)
             ):
