@@ -2066,6 +2066,12 @@ def main():
     if initial_pos > 0:
         position_size = initial_pos
         last_order_size = initial_pos
+    max_position_cap: Optional[float] = None
+    if manual_order_size is not None and manual_size_is_target:
+        try:
+            max_position_cap = max(float(manual_order_size), 0.0)
+        except (TypeError, ValueError):
+            max_position_cap = None
     last_log: Optional[float] = None
     buy_cooldown_until: float = 0.0
     pending_buy: Optional[Action] = None
@@ -2083,19 +2089,52 @@ def main():
         except Exception as probe_exc:
             print(f"[WATCHDOG][POSITION] {reason} 持仓查询异常：{probe_exc}")
             return
+
+        status_snapshot = strategy.status()
+        current_state = status_snapshot.get("state")
+        has_local_position = _extract_position_size(status_snapshot) > 0
         new_size, changed = _merge_remote_position_size(position_size, total_pos)
-        if not changed:
-            return
         position_size = new_size
+        should_sync_state = changed
+
+        if not should_sync_state:
+            # 即便仓位未变动，也要校正策略状态：
+            #  - 远端有仓位但策略仍为 FLAT；
+            #  - 远端无仓位但策略仍为 LONG。
+            should_sync_state = (
+                (new_size is not None and current_state != "LONG")
+                or (new_size is None and (current_state != "FLAT" or has_local_position))
+            )
+
+        if not should_sync_state:
+            return
+
         origin_display = origin_note or "positions"
         avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
         if new_size is None:
             print(
                 f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} 当前无持仓"
             )
+            latest_bid = _latest_best_bid()
+            fallback_px = latest_bid if latest_bid is not None else 0.0
+            strategy.on_sell_filled(avg_price=fallback_px, remaining=0.0)
+            print(
+                f"[STATE] 同步策略为空仓 (fallback_px={fallback_px:.4f})"
+            )
         else:
             print(
                 f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} size={new_size:.4f}"
+            )
+            latest_bid = _latest_best_bid()
+            latest_ask = _latest_best_ask()
+            fallback_px = avg_px
+            if fallback_px is None:
+                fallback_px = latest_ask if latest_ask is not None else latest_bid
+            if fallback_px is None:
+                fallback_px = 0.0
+            strategy.on_buy_filled(fallback_px, total_position=new_size, size=0.0)
+            print(
+                f"[STATE] 同步策略持仓 -> price={fallback_px:.4f} size={new_size:.4f}"
             )
 
     def _execute_sell(
@@ -2350,6 +2389,9 @@ def main():
                 pending_buy = action
                 continue
 
+            if max_position_cap is not None:
+                _maybe_refresh_position_size("[BUY][PRE]", force=True)
+
             ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
             if manual_order_size is not None:
                 probed_size, origin_display = _probe_position_size_for_buy()
@@ -2369,6 +2411,8 @@ def main():
                     print(
                         f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
                     )
+                    if max_position_cap is not None:
+                        _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
                     strategy.on_reject("manual target already satisfied")
                     continue
                 if planned_size is None or planned_size <= 0:
@@ -2376,6 +2420,21 @@ def main():
                     strategy.on_reject("invalid manual size")
                     continue
                 order_size = planned_size
+                if max_position_cap is not None:
+                    remaining_cap = max(max_position_cap - owned, 0.0)
+                    if remaining_cap <= 0:
+                        origin_note = origin_display or "positions"
+                        print(
+                            f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已达到封顶 {max_position_cap:.4f}，跳过本次买入。"
+                        )
+                        _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
+                        strategy.on_reject("position cap reached")
+                        continue
+                    if order_size > remaining_cap:
+                        print(
+                            f"[HINT][BUY] 按封顶 {max_position_cap:.4f} 调整下单量 {order_size:.4f} -> {remaining_cap:.4f}"
+                        )
+                        order_size = remaining_cap
                 origin_hint = f"({origin_display})" if origin_display else ""
                 if manual_size_is_target:
                     print(
