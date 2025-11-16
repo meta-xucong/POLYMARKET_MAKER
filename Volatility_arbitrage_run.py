@@ -75,6 +75,7 @@ DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com
 API_MIN_ORDER_SIZE = 5.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
+POST_BUY_POSITION_CHECK_DELAY = 5.0
 
 
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
@@ -2519,6 +2520,11 @@ def main():
                 actual_avg_price: Optional[float] = None
                 actual_total_position: Optional[float] = None
                 origin_note = ""
+                if POST_BUY_POSITION_CHECK_DELAY > 0:
+                    print(
+                        f"[INFO] 买入成交，延迟 {POST_BUY_POSITION_CHECK_DELAY:.0f}s 再查询持仓均价，等待 data-api 刷新…"
+                    )
+                    time.sleep(POST_BUY_POSITION_CHECK_DELAY)
                 try:
                     actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
                         client, token_id
