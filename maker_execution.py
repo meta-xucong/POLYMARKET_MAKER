@@ -642,6 +642,7 @@ def maker_sell_follow_ask_with_floor_wait(
     progress_probe_interval: float = 60.0,
     position_fetcher: Optional[Callable[[], Optional[float]]] = None,
     position_refresh_interval: float = 30.0,
+    ask_validation_interval: float = 60.0,
 ) -> Dict[str, Any]:
     """Maintain a maker sell order while respecting a profit floor."""
 
@@ -700,8 +701,16 @@ def maker_sell_follow_ask_with_floor_wait(
     if position_refresh_interval < 0:
         position_fetcher = None
 
+    try:
+        ask_validation_interval = float(ask_validation_interval)
+    except (TypeError, ValueError):
+        ask_validation_interval = 60.0
+    if ask_validation_interval <= 0:
+        ask_validation_interval = None
+
     next_probe_at = 0.0
     next_position_refresh = 0.0
+    next_ask_validation = 0.0
 
     while True:
         if stop_check and stop_check():
@@ -773,6 +782,26 @@ def maker_sell_follow_ask_with_floor_wait(
             break
 
         ask = _best_ask(client, token_id, best_ask_fn)
+        if ask_validation_interval and now >= max(next_ask_validation, 0.0):
+            interval = max(ask_validation_interval, poll_sec, 1e-6)
+            next_ask_validation = now + interval
+            validated = _fetch_best_price(client, token_id, "ask")
+            if validated is not None and validated.price > 0:
+                validated_price = float(validated.price)
+                tolerance = max(tick * 0.5, 1e-6)
+                if ask is None or abs(validated_price - ask) > tolerance:
+                    prev = ask
+                    ask = validated_price
+                    direction = "下行" if prev is not None and validated_price < prev else "上行"
+                    if prev is None:
+                        print(
+                            f"[MAKER][SELL] 卖一校验覆盖：无本地价，采用最新卖一 {ask:.{SELL_PRICE_DP}f}"
+                        )
+                    else:
+                        print(
+                            "[MAKER][SELL] 卖一校验覆盖（" + direction + ") -> "
+                            f"old={prev:.{SELL_PRICE_DP}f} new={ask:.{SELL_PRICE_DP}f}"
+                        )
         if not aggressive_mode:
             if ask is None or ask <= 0:
                 waiting_for_floor = True
