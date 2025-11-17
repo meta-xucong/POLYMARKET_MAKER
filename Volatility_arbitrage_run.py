@@ -454,28 +454,43 @@ def _should_offer_common_deadline_options(meta: Optional[Dict[str, Any]]) -> boo
 
 def _prompt_common_deadline_override(
     base_date_utc: date,
+    *,
+    allow_skip: bool = False,
+    intro_text: Optional[str] = None,
 ) -> Tuple[Optional[float], bool]:
-    print(
-        "[WARN] 自动获取的截止时间缺少明确的时区/时刻信息，"
-        "将基于事件标注日期"
-        f" {base_date_utc.isoformat()} 进行人工选择。"
-    )
-    print(
-        "请选择常用结束时间点（默认 1）：\n"
-        "  [1] 12:00 PM ET（金融 / 市场预测类）\n"
-        "  [2] 23:59 ET（天气 / 逐日统计类）\n"
-        "  [3] UTC 00:00（跨时区国际事件）\n"
-        "  [4] 不设定结束时间点"
-    )
+    if intro_text:
+        print(intro_text)
+    else:
+        print(
+            "[WARN] 自动获取的截止时间缺少明确的时区/时刻信息，",
+            "将基于事件标注日期",
+            f" {base_date_utc.isoformat()} 进行人工选择。",
+        )
+        print(
+            "请选择常用结束时间点（默认 1）：\\n",
+            "  [1] 12:00 PM ET（金融 / 市场预测类）\\n",
+            "  [2] 23:59 ET（天气 / 逐日统计类）\\n",
+            "  [3] UTC 00:00（跨时区国际事件）\\n",
+            "  [4] 不设定结束时间点",
+        )
     options = {
         "1": {"label": "12:00 PM ET", "hour": 12, "minute": 0, "tz": "America/New_York", "fallback": -240},
         "2": {"label": "23:59 ET", "hour": 23, "minute": 59, "tz": "America/New_York", "fallback": -240},
         "3": {"label": "00:00 UTC", "hour": 0, "minute": 0, "tz": "UTC", "fallback": 0},
         "4": {"label": "不设定结束时间点", "no_deadline": True},
     }
+    if allow_skip:
+        print(
+            "如需使用以上常用时间点覆盖市场截止时间，请输入编号；"
+            "直接回车则沿用自动识别的截止日期。"
+        )
+
     choice = ""
     while choice not in options:
         raw = input().strip()
+        if allow_skip and not raw:
+            print("[INFO] 已沿用自动识别的截止时间。")
+            return None, False
         choice = raw or "1"
         if choice not in options:
             print("[ERR] 请输入 1、2、3 或 4：")
@@ -495,10 +510,9 @@ def _prompt_common_deadline_override(
     utc_dt = local_dt.astimezone(timezone.utc)
     print(
         "[INFO] 已手动指定该市场监控截止为 "
-        f"{local_dt.isoformat()} ({spec['label']})，即 UTC {utc_dt.isoformat()}。"
+        f"{local_dt.isoformat()} ({spec['label']})，即 UTC {utc_dt.isoformat()}。",
     )
     return utc_dt.timestamp(), False
-
 
 def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
@@ -1524,7 +1538,36 @@ def main():
         return min(candidates) if candidates else None
 
     market_deadline_ts = _calc_deadline(market_meta)
-    if _should_offer_common_deadline_options(market_meta):
+    if market_deadline_ts and market_meta.get("end_ts_precise"):
+        base_date_utc = datetime.fromtimestamp(
+            float(market_deadline_ts), tz=timezone.utc
+        ).date()
+        override_ts, deadline_disabled = _prompt_common_deadline_override(
+            base_date_utc,
+            allow_skip=True,
+            intro_text=(
+                "[Q] 已自动识别市场截止时间。如需按常用时区结束时间点覆盖，"
+                "请输入选项编号（直接回车沿用自动截止日期）：\n"
+                "  [1] 12:00 PM ET（金融 / 市场预测类）\n"
+                "  [2] 23:59 ET（天气 / 逐日统计类）\n"
+                "  [3] UTC 00:00（跨时区国际事件）\n"
+                "  [4] 不设定结束时间点"
+            ),
+        )
+        manual_deadline_disabled = deadline_disabled
+        if override_ts is not None:
+            manual_deadline_override_ts = override_ts
+            market_meta = _apply_manual_deadline_override_meta(
+                market_meta,
+                manual_deadline_override_ts,
+            )
+            market_deadline_ts = _calc_deadline(market_meta)
+        if manual_deadline_disabled:
+            market_meta = dict(market_meta or {})
+            market_meta.pop("end_ts", None)
+            market_meta.pop("resolved_ts", None)
+            market_deadline_ts = None
+    if not manual_deadline_disabled and _should_offer_common_deadline_options(market_meta):
         base_end_ts = market_meta.get("end_ts")
         if isinstance(base_end_ts, (int, float)):
             base_date_utc = datetime.fromtimestamp(
