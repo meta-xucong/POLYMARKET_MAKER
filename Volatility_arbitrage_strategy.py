@@ -142,6 +142,8 @@ class VolArbStrategy:
         self._last_best_ask = best_ask
         self._last_best_bid = best_bid
 
+        self._maybe_reconcile_dust_position()
+
         price_for_drop = self._prepare_price_history(ts, (best_bid + best_ask) / 2)
 
         if self._manual_stop:
@@ -589,6 +591,31 @@ class VolArbStrategy:
         else:
             new_drop = current + step
         self.cfg.drop_pct = new_drop
+
+    def _maybe_reconcile_dust_position(self) -> None:
+        """If current持仓低于最小可交易量，则将状态重置为空仓。"""
+
+        if self._state != "LONG":
+            return
+        if self._position_size is None:
+            return
+
+        min_order = self._min_market_order_size
+        if min_order is None:
+            return
+
+        dust_floor = max(min_order, 1e-4)
+        try:
+            size = float(self._position_size)
+        except (TypeError, ValueError):
+            return
+
+        if size <= dust_floor:
+            self._state = "FLAT"
+            self._position_size = None
+            self._entry_price = None
+            if self._awaiting != ActionType.BUY:
+                self._awaiting = None
 
     @staticmethod
     def _normalize_min_market_order_size(value: Optional[float]) -> Optional[float]:
