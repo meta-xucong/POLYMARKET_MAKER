@@ -2131,6 +2131,13 @@ def main():
         except (TypeError, ValueError):
             return None
 
+    def _awaiting_blocking(awaiting: Any) -> bool:
+        if awaiting is None:
+            return False
+        if awaiting == ActionType.BUY and awaiting_buy_passthrough:
+            return False
+        return True
+
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
     status_snapshot = strategy.status()
@@ -2149,6 +2156,7 @@ def main():
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
     next_position_sync: float = 0.0
+    awaiting_buy_passthrough: bool = True
 
     def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
         nonlocal position_size, next_position_sync
@@ -2386,9 +2394,7 @@ def main():
                             has_position = True
                             break
 
-                    awaiting_blocking = (
-                        awaiting is not None and awaiting != ActionType.BUY
-                    )
+                    awaiting_blocking = _awaiting_blocking(awaiting)
                     if state != "FLAT" or awaiting_blocking or has_position:
                         reason = (
                             "cooldown ended but still in position"
@@ -2536,17 +2542,13 @@ def main():
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
 
-            awaiting_blocking = (
-                awaiting is not None and awaiting != ActionType.BUY
-            )
+            awaiting_blocking = _awaiting_blocking(awaiting)
             if current_state != "FLAT" or awaiting_blocking:
                 _maybe_refresh_position_size("[BUY][STATE-SYNC]", force=True)
                 status = strategy.status()
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
-                awaiting_blocking = (
-                    awaiting is not None and awaiting != ActionType.BUY
-                )
+                awaiting_blocking = _awaiting_blocking(awaiting)
                 if current_state != "FLAT" or awaiting_blocking:
                     print(
                         "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
@@ -2639,6 +2641,8 @@ def main():
                     f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
                 )
 
+            if awaiting_buy_passthrough:
+                awaiting_buy_passthrough = False
             try:
                 buy_resp = maker_buy_follow_bid(
                     client=client,
