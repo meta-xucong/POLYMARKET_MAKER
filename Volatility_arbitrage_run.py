@@ -2386,7 +2386,10 @@ def main():
                             has_position = True
                             break
 
-                    if state != "FLAT" or awaiting is not None or has_position:
+                    awaiting_blocking = (
+                        awaiting is not None and awaiting != ActionType.BUY
+                    )
+                    if state != "FLAT" or awaiting_blocking or has_position:
                         reason = (
                             "cooldown ended but still in position"
                             if has_position
@@ -2533,12 +2536,18 @@ def main():
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
 
-            if current_state != "FLAT" or awaiting is not None:
+            awaiting_blocking = (
+                awaiting is not None and awaiting != ActionType.BUY
+            )
+            if current_state != "FLAT" or awaiting_blocking:
                 _maybe_refresh_position_size("[BUY][STATE-SYNC]", force=True)
                 status = strategy.status()
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
-                if current_state != "FLAT" or awaiting is not None:
+                awaiting_blocking = (
+                    awaiting is not None and awaiting != ActionType.BUY
+                )
+                if current_state != "FLAT" or awaiting_blocking:
                     print(
                         "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
                     )
