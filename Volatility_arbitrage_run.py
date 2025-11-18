@@ -633,22 +633,26 @@ def _merge_remote_position_size(
     remote_size: Optional[float],
     *,
     eps: float = 1e-6,
+    dust_floor: Optional[float] = None,
 ) -> Tuple[Optional[float], bool]:
     """Return normalized remote size and whether it differs from the current state."""
 
-    def _normalize(value: Optional[float]) -> Optional[float]:
+    def _normalize(value: Optional[float], *, apply_dust: bool) -> Optional[float]:
         if value is None:
             return None
         try:
             normalized = float(value)
         except (TypeError, ValueError):
             return None
-        if normalized <= eps:
+        floor = eps
+        if apply_dust and isinstance(dust_floor, (int, float)):
+            floor = max(float(dust_floor), floor)
+        if normalized <= floor:
             return None
         return normalized
 
-    current_norm = _normalize(current_size)
-    remote_norm = _normalize(remote_size)
+    current_norm = _normalize(current_size, apply_dust=False)
+    remote_norm = _normalize(remote_size, apply_dust=True)
 
     if current_norm is None and remote_norm is None:
         return None, False
@@ -2161,7 +2165,11 @@ def main():
         status_snapshot = strategy.status()
         current_state = status_snapshot.get("state")
         has_local_position = _extract_position_size(status_snapshot) > 0
-        new_size, changed = _merge_remote_position_size(position_size, total_pos)
+        eps = 1e-6
+        dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
+        new_size, changed = _merge_remote_position_size(
+            position_size, total_pos, dust_floor=dust_floor
+        )
         position_size = new_size
         should_sync_state = changed
 
@@ -2180,8 +2188,11 @@ def main():
         origin_display = origin_note or "positions"
         avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
         if new_size is None:
+            dust_note = ""
+            if total_pos is not None and total_pos < dust_floor - eps:
+                dust_note = f" (size={float(total_pos):.4f} < 最小挂单量 {dust_floor:.2f}，视为无持仓)"
             print(
-                f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} 当前无持仓"
+                f"[WATCHDOG][POSITION] {reason} -> origin={origin_display} avg={avg_display} 当前无持仓{dust_note}"
             )
             latest_bid = _latest_best_bid()
             fallback_px = latest_bid if latest_bid is not None else 0.0
@@ -2204,6 +2215,11 @@ def main():
             print(
                 f"[STATE] 同步策略持仓 -> price={fallback_px:.4f} size={new_size:.4f}"
             )
+            try:
+                if position_size is not None:
+                    _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
+            except Exception as exc:
+                print(f"[WATCHDOG][POSITION] 自动卖出旧仓位失败：{exc}")
 
     def _execute_sell(
         order_qty: Optional[float],
