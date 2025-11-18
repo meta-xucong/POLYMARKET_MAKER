@@ -2495,18 +2495,55 @@ def main():
             current_state = status.get("state")
             awaiting = status.get("awaiting")
             strat_pos = status.get("position_size")
-            has_position = False
+            raw_position: Optional[float] = None
+            actionable_position: Optional[float] = None
+            treat_as_dust: bool = False
             for pos in (position_size, strat_pos):
-                if pos is not None and pos > dust_floor:
-                    has_position = True
-                    break
+                try:
+                    val = float(pos)
+                except (TypeError, ValueError):
+                    continue
+                if val <= 0:
+                    continue
+                raw_position = max(raw_position or 0.0, val)
+            if raw_position is not None:
+                if raw_position > dust_floor:
+                    actionable_position = raw_position
+                else:
+                    treat_as_dust = True
 
-            if current_state != "FLAT" or awaiting is not None or has_position:
+            if actionable_position is not None:
                 print(
-                    "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
+                    f"[BUY][BLOCK] 检测到可卖出仓位 {actionable_position:.4f}，先清仓后再尝试买入。"
                 )
-                strategy.on_reject("state not flat or position exists")
+                pending_buy = action
+                buy_cooldown_until = time.time() + short_buy_cooldown
+                _execute_sell(actionable_position, floor_hint=None, source="[BUY][BLOCK]")
                 continue
+
+            if treat_as_dust:
+                fallback_px = bid if bid > 0 else ask
+                strategy.on_sell_filled(avg_price=fallback_px or 0.0, remaining=0.0)
+                position_size = None
+                last_order_size = None
+                print(
+                    f"[BUY][DUST] 检测到尘埃仓位 {raw_position:.4f} < 最小挂单量 {dust_floor:.2f}，忽略并继续买入。"
+                )
+                status = strategy.status()
+                current_state = status.get("state")
+                awaiting = status.get("awaiting")
+
+            if current_state != "FLAT" or awaiting is not None:
+                _maybe_refresh_position_size("[BUY][STATE-SYNC]", force=True)
+                status = strategy.status()
+                current_state = status.get("state")
+                awaiting = status.get("awaiting")
+                if current_state != "FLAT" or awaiting is not None:
+                    print(
+                        "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
+                    )
+                    strategy.on_reject("state not flat or position exists")
+                    continue
             now_for_buy = time.time()
             if now_for_buy < buy_cooldown_until:
                 remaining = buy_cooldown_until - now_for_buy
