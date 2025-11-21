@@ -2172,6 +2172,11 @@ def main():
 
         status_snapshot = strategy.status()
         current_state = status_snapshot.get("state")
+        awaiting = status_snapshot.get("awaiting")
+        awaiting_is_sell = False
+        if awaiting is not None:
+            awaiting_val = getattr(awaiting, "value", awaiting)
+            awaiting_is_sell = awaiting_val == ActionType.SELL
         has_local_position = _extract_position_size(status_snapshot) > 0
         eps = 1e-6
         dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
@@ -2189,6 +2194,11 @@ def main():
                 (new_size is not None and current_state != "LONG")
                 or (new_size is None and (current_state != "FLAT" or has_local_position))
             )
+
+        # 若仍处于卖出待确认状态但已无有效仓位，也需强制刷新为空仓，避免卡在 BUY 前置检查。
+        if not should_sync_state and awaiting_is_sell:
+            remote_is_dust = total_pos is not None and total_pos < dust_floor - eps
+            should_sync_state = new_size is None or remote_is_dust
 
         if not should_sync_state:
             return
