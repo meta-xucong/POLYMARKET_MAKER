@@ -2559,6 +2559,39 @@ def main():
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
                 awaiting_blocking = _awaiting_blocking(awaiting)
+
+                # 强制兜底：
+                # 1) 若策略仍认为持仓但本地/策略均无可用仓位，直接同步为空仓；
+                # 2) 若存在遗留的 BUY 待确认，自动解除阻塞。
+                combined_pos = _extract_position_size(status)
+                local_pos_candidates = [position_size, strat_pos]
+                for pos in local_pos_candidates:
+                    try:
+                        numeric = float(pos) if pos is not None else 0.0
+                    except (TypeError, ValueError):
+                        continue
+                    if numeric > combined_pos:
+                        combined_pos = numeric
+
+                if current_state != "FLAT" and (combined_pos is None or combined_pos <= dust_floor):
+                    fallback_px = bid if bid > 0 else ask
+                    strategy.on_sell_filled(avg_price=fallback_px or 0.0, remaining=0.0)
+                    position_size = None
+                    last_order_size = None
+                    status = strategy.status()
+                    current_state = status.get("state")
+                    awaiting = status.get("awaiting")
+                    awaiting_blocking = _awaiting_blocking(awaiting)
+
+                if awaiting_blocking:
+                    awaiting_val = getattr(awaiting, "value", awaiting)
+                    if awaiting_val == ActionType.BUY:
+                        strategy.on_reject("auto-clear stale awaiting BUY")
+                        status = strategy.status()
+                        current_state = status.get("state")
+                        awaiting = status.get("awaiting")
+                        awaiting_blocking = _awaiting_blocking(awaiting)
+
                 if current_state != "FLAT" or awaiting_blocking:
                     print(
                         "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
