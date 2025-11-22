@@ -2684,6 +2684,18 @@ def main():
                     f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
                 )
 
+            baseline_position = float(position_size or 0.0)
+
+            def _buy_fill_delta_probe() -> Optional[float]:
+                try:
+                    _, latest_pos, _ = _lookup_position_avg_price(client, token_id)
+                except Exception as probe_exc:
+                    print(f"[WATCHDOG][BUY] 持仓校对异常：{probe_exc}")
+                    return None
+                if latest_pos is None:
+                    return None
+                return max(float(latest_pos) - baseline_position, 0.0)
+
             if awaiting_buy_passthrough:
                 awaiting_buy_passthrough = False
             try:
@@ -2696,6 +2708,7 @@ def main():
                     min_order_size=API_MIN_ORDER_SIZE,
                     best_bid_fn=_latest_best_bid,
                     stop_check=stop_event.is_set,
+                    external_fill_probe=_buy_fill_delta_probe,
                     progress_probe=_buy_progress_probe,
                     progress_probe_interval=60.0,
                 )

@@ -357,6 +357,7 @@ def maker_buy_follow_bid(
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
     price_dp: Optional[int] = None,
+    external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid."""
 
@@ -393,6 +394,8 @@ def maker_buy_follow_bid(
     # 使用较大的缩减步长，避免余额不足时无限微调导致大量无效重试
     size_tick = max(_order_tick(BUY_SIZE_DP), 0.01)
     shortage_retry_count = 0
+    min_shrink_interval = 0.1
+    last_shrink_time = 0.0
 
     next_probe_at = 0.0
 
@@ -445,7 +448,7 @@ def maker_buy_follow_bid(
             return False
 
     def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
-        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick
+        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time
 
         print(reason)
         if active_order:
@@ -463,6 +466,15 @@ def maker_buy_follow_bid(
         if shortage_retry_count > 20 and size_tick < 0.1:
             size_tick = 0.1
             print("[MAKER][BUY] 余额不足重试超过 20 次，提升缩减步长至 0.1。")
+
+        now = time.monotonic()
+        elapsed = now - last_shrink_time
+        if elapsed < min_shrink_interval:
+            sleep_duration = min_shrink_interval - elapsed
+            if sleep_duration > 0:
+                sleep_fn(sleep_duration)
+            now = time.monotonic()
+        last_shrink_time = now
 
         shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), BUY_SIZE_DP)
         min_viable = max(min_viable or 0.0, api_min_qty or 0.0)
@@ -607,6 +619,19 @@ def maker_buy_follow_bid(
             expected_full_size=record_size,
         )
         filled_total = sum(accounted.values())
+        if external_fill_probe is not None:
+            try:
+                external_filled = external_fill_probe()
+            except Exception as probe_exc:
+                print(f"[MAKER][BUY] 外部持仓校对异常：{probe_exc}")
+                external_filled = None
+            if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
+                filled_total = external_filled
+                remaining = max(goal_size - filled_total, 0.0)
+                print(
+                    f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f} "
+                    f"remaining={remaining:.{BUY_SIZE_DP}f}"
+                )
         remaining = max(goal_size - filled_total, 0.0)
         status_text_upper = status_text.upper()
         if record is not None:
