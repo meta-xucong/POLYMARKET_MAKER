@@ -390,7 +390,8 @@ def maker_buy_follow_bid(
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
-    size_tick = _order_tick(BUY_SIZE_DP)
+    # 使用较大的缩减步长，避免余额不足时无限微调导致大量无效重试
+    size_tick = max(_order_tick(BUY_SIZE_DP), 0.01)
 
     next_probe_at = 0.0
 
