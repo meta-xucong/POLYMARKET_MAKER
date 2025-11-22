@@ -357,6 +357,7 @@ def maker_buy_follow_bid(
     progress_probe: Optional[Callable[[], None]] = None,
     progress_probe_interval: float = 60.0,
     price_dp: Optional[int] = None,
+    external_fill_probe: Optional[Callable[[], Optional[float]]] = None,
 ) -> Dict[str, Any]:
     """Continuously maintain a maker buy order following the market bid."""
 
@@ -618,6 +619,19 @@ def maker_buy_follow_bid(
             expected_full_size=record_size,
         )
         filled_total = sum(accounted.values())
+        if external_fill_probe is not None:
+            try:
+                external_filled = external_fill_probe()
+            except Exception as probe_exc:
+                print(f"[MAKER][BUY] 外部持仓校对异常：{probe_exc}")
+                external_filled = None
+            if external_filled is not None and external_filled > filled_total + _MIN_FILL_EPS:
+                filled_total = external_filled
+                remaining = max(goal_size - filled_total, 0.0)
+                print(
+                    f"[MAKER][BUY] 校对持仓后更新累计成交 -> filled={filled_total:.{BUY_SIZE_DP}f} "
+                    f"remaining={remaining:.{BUY_SIZE_DP}f}"
+                )
         remaining = max(goal_size - filled_total, 0.0)
         status_text_upper = status_text.upper()
         if record is not None:
