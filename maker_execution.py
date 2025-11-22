@@ -390,7 +390,8 @@ def maker_buy_follow_bid(
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
-    size_tick = _order_tick(BUY_SIZE_DP)
+    # 使用较大的缩减步长，避免余额不足时无限微调导致大量无效重试
+    size_tick = max(_order_tick(BUY_SIZE_DP), 0.01)
 
     next_probe_at = 0.0
 
@@ -407,7 +408,31 @@ def maker_buy_follow_bid(
     def _is_insufficient_balance(value: object) -> bool:
         def _text_has_shortage(text: str) -> bool:
             lowered = text.lower()
-            return "insufficient" in lowered and ("balance" in lowered or "fund" in lowered)
+            shortage_keywords = ("insufficient", "not enough")
+            balance_keywords = ("balance", "fund", "allowance")
+            return any(key in lowered for key in shortage_keywords) and any(
+                key in lowered for key in balance_keywords
+            )
+
+        if hasattr(value, "error_message"):
+            try:
+                if _is_insufficient_balance(getattr(value, "error_message")):
+                    return True
+            except Exception:
+                pass
+        if hasattr(value, "response"):
+            try:
+                if _is_insufficient_balance(getattr(value, "response")):
+                    return True
+            except Exception:
+                pass
+        if hasattr(value, "args"):
+            try:
+                for arg in getattr(value, "args", ()):
+                    if _is_insufficient_balance(arg):
+                        return True
+            except Exception:
+                pass
 
         if isinstance(value, dict):
             for key in ("error", "message", "detail", "reason", "status"):
