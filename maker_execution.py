@@ -393,6 +393,8 @@ def maker_buy_follow_bid(
     # 使用较大的缩减步长，避免余额不足时无限微调导致大量无效重试
     size_tick = max(_order_tick(BUY_SIZE_DP), 0.01)
     shortage_retry_count = 0
+    min_shrink_interval = 0.1
+    last_shrink_time = 0.0
 
     next_probe_at = 0.0
 
@@ -445,7 +447,7 @@ def maker_buy_follow_bid(
             return False
 
     def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
-        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick
+        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time
 
         print(reason)
         if active_order:
@@ -463,6 +465,15 @@ def maker_buy_follow_bid(
         if shortage_retry_count > 20 and size_tick < 0.1:
             size_tick = 0.1
             print("[MAKER][BUY] 余额不足重试超过 20 次，提升缩减步长至 0.1。")
+
+        now = time.monotonic()
+        elapsed = now - last_shrink_time
+        if elapsed < min_shrink_interval:
+            sleep_duration = min_shrink_interval - elapsed
+            if sleep_duration > 0:
+                sleep_fn(sleep_duration)
+            now = time.monotonic()
+        last_shrink_time = now
 
         shrink_candidate = _ceil_to_dp(max(current_remaining - size_tick, 0.0), BUY_SIZE_DP)
         min_viable = max(min_viable or 0.0, api_min_qty or 0.0)
