@@ -391,8 +391,8 @@ def maker_buy_follow_bid(
     base_price_dp = BUY_PRICE_DP if price_dp is None else max(int(price_dp), 0)
     price_dp_active = base_price_dp
     tick = _order_tick(price_dp_active)
-    # 使用较大的缩减步长，避免余额不足时无限微调导致大量无效重试
-    size_tick = max(_order_tick(BUY_SIZE_DP), 0.01)
+    # 采用统一的两级缩减步长，先用 0.01，多次失败后升级到 0.1
+    size_tick = 0.01
     shortage_retry_count = 0
     min_shrink_interval = 0.1
     last_shrink_time = 0.0
@@ -463,9 +463,9 @@ def maker_buy_follow_bid(
             final_status = "FILLED" if filled_total > _MIN_FILL_EPS else final_status
             return True
         shortage_retry_count += 1
-        if shortage_retry_count > 20 and size_tick < 0.1:
+        if shortage_retry_count > 100 and size_tick < 0.1:
             size_tick = 0.1
-            print("[MAKER][BUY] 余额不足重试超过 20 次，提升缩减步长至 0.1。")
+            print("[MAKER][BUY] 余额不足重试超过 100 次，提升缩减步长至 0.1。")
 
         now = time.monotonic()
         elapsed = now - last_shrink_time
@@ -775,6 +775,9 @@ def maker_sell_follow_ask_with_floor_wait(
     aggressive_next_price_override: Optional[float] = None
     aggressive_locked_price: Optional[float] = None
     next_price_override: Optional[float] = None
+    # 统一两级缩减步长，先用 0.01，必要时再升级到 0.1
+    shrink_tick = 0.01
+    shortage_retry_count = 0
     try:
         aggressive_timeout = float(aggressive_timeout)
     except (TypeError, ValueError):
@@ -996,8 +999,13 @@ def maker_sell_follow_ask_with_floor_wait(
                     keyword in msg for keyword in ("insufficient", "balance", "position")
                 )
                 if insufficient:
+                    shortage_retry_count += 1
+                    if shortage_retry_count > 100 and shrink_tick < 0.1 - 1e-12:
+                        shrink_tick = 0.1
                     current_remaining = max(goal_size - filled_total, 0.0)
-                    shrink_qty = _floor_to_dp(max(current_remaining - tick, 0.0), SELL_SIZE_DP)
+                    shrink_qty = _floor_to_dp(
+                        max(current_remaining - shrink_tick, 0.0), SELL_SIZE_DP
+                    )
                     if shrink_qty >= 0.01 and (
                         not api_min_qty or shrink_qty + _MIN_FILL_EPS >= api_min_qty
                     ):
