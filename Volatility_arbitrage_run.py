@@ -1996,68 +1996,6 @@ def main():
                     return
                 time.sleep(1)
 
-    def _activate_sell_only(reason: str) -> None:
-        nonlocal exit_after_sell_only_clear
-        if sell_only_event.is_set():
-            return
-
-        sell_only_event.set()
-        strategy.enable_sell_only(reason)
-        _maybe_refresh_position_size("[COUNTDOWN] 进入仅卖出模式前同步持仓", force=True)
-        has_position = _has_actionable_position()
-
-        print("[COUNTDOWN] 已进入仅卖出模式：倒计时窗口内不再买入。")
-        if has_position:
-            exit_after_sell_only_clear = True
-            print("[COUNTDOWN] 仍有持仓，将继续等待卖出，清仓后停止脚本。")
-        else:
-            print("[COUNTDOWN] 当前无持仓，倒计时仅卖出模式下直接停止脚本。")
-            strategy.stop("countdown sell-only window (flat)")
-            stop_event.set()
-
-    def _countdown_monitor():
-        if not market_deadline_ts:
-            return
-        last_display: Optional[int] = None
-        sell_only_warn_logged = False
-        while not stop_event.is_set():
-            now = time.time()
-            if sell_only_start_ts and not sell_only_event.is_set():
-                until_sell_only = sell_only_start_ts - now
-                if until_sell_only <= 0:
-                    _activate_sell_only("countdown window")
-                elif until_sell_only <= 300 and not sell_only_warn_logged:
-                    mins = int(max(until_sell_only, 0) // 60)
-                    secs = int(max(until_sell_only, 0) % 60)
-                    print(
-                        "[COUNTDOWN] 距离仅卖出模式开启还剩 "
-                        f"{mins:02d}:{secs:02d}。"
-                    )
-                    sell_only_warn_logged = True
-            remaining = market_deadline_ts - now
-            if remaining <= 0:
-                if last_display != 0:
-                    print("[COUNTDOWN] 距离市场结束还剩 00:00")
-                print("[COUNTDOWN] 倒计时结束，开始确认市场状态…")
-                _confirm_market_closed()
-                return
-            if remaining <= 300:
-                secs_left = int(remaining)
-                if secs_left != last_display:
-                    mm = secs_left // 60
-                    ss = secs_left % 60
-                    print(
-                        f"[COUNTDOWN] 距离市场结束还剩 {mm:02d}:{ss:02d}"
-                    )
-                    last_display = secs_left
-                for _ in range(5):
-                    if stop_event.is_set():
-                        return
-                    time.sleep(0.2)
-            else:
-                wait = min(remaining - 300, 60)
-                if wait <= 0:
-                    wait = 1
                 for _ in range(int(wait)):
                     if stop_event.is_set():
                         return
@@ -2275,6 +2213,69 @@ def main():
                     _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
             except Exception as exc:
                 print(f"[WATCHDOG][POSITION] 自动卖出旧仓位失败：{exc}")
+
+    def _activate_sell_only(reason: str) -> None:
+        nonlocal exit_after_sell_only_clear
+        if sell_only_event.is_set():
+            return
+
+        sell_only_event.set()
+        strategy.enable_sell_only(reason)
+        _maybe_refresh_position_size("[COUNTDOWN] 进入仅卖出模式前同步持仓", force=True)
+        has_position = _has_actionable_position()
+
+        print("[COUNTDOWN] 已进入仅卖出模式：倒计时窗口内不再买入。")
+        if has_position:
+            exit_after_sell_only_clear = True
+            print("[COUNTDOWN] 仍有持仓，将继续等待卖出，清仓后停止脚本。")
+        else:
+            print("[COUNTDOWN] 当前无持仓，倒计时仅卖出模式下直接停止脚本。")
+            strategy.stop("countdown sell-only window (flat)")
+            stop_event.set()
+
+    def _countdown_monitor():
+        if not market_deadline_ts:
+            return
+        last_display: Optional[int] = None
+        sell_only_warn_logged = False
+        while not stop_event.is_set():
+            now = time.time()
+            if sell_only_start_ts and not sell_only_event.is_set():
+                until_sell_only = sell_only_start_ts - now
+                if until_sell_only <= 0:
+                    _activate_sell_only("countdown window")
+                elif until_sell_only <= 300 and not sell_only_warn_logged:
+                    mins = int(max(until_sell_only, 0) // 60)
+                    secs = int(max(until_sell_only, 0) % 60)
+                    print(
+                        "[COUNTDOWN] 距离仅卖出模式开启还剩 "
+                        f"{mins:02d}:{secs:02d}。"
+                    )
+                    sell_only_warn_logged = True
+            remaining = market_deadline_ts - now
+            if remaining <= 0:
+                if last_display != 0:
+                    print("[COUNTDOWN] 距离市场结束还剩 00:00")
+                print("[COUNTDOWN] 倒计时结束，开始确认市场状态…")
+                _confirm_market_closed()
+                return
+            if remaining <= 300:
+                secs_left = int(remaining)
+                if secs_left != last_display:
+                    mm = secs_left // 60
+                    ss = secs_left % 60
+                    print(
+                        f"[COUNTDOWN] 距离市场结束还剩 {mm:02d}:{ss:02d}"
+                    )
+                    last_display = secs_left
+                for _ in range(5):
+                    if stop_event.is_set():
+                        return
+                    time.sleep(0.2)
+            else:
+                wait = min(remaining - 300, 60)
+                if wait <= 0:
+                    wait = 1
 
     if sell_only_start_ts and time.time() >= sell_only_start_ts:
         _activate_sell_only("countdown window")
