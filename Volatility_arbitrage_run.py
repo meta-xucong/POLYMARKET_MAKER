@@ -2015,9 +2015,6 @@ def main():
 
     print("[RUN] 监听行情中… 输入 stop / exit 可手动停止。")
 
-    if market_deadline_ts:
-        threading.Thread(target=_countdown_monitor, daemon=True).start()
-
     start_wait = time.time()
     while not latest.get(token_id) and not stop_event.is_set():
         if time.time() - start_wait > 5:
@@ -2279,6 +2276,9 @@ def main():
 
     if sell_only_start_ts and time.time() >= sell_only_start_ts:
         _activate_sell_only("countdown window")
+
+    if market_deadline_ts:
+        threading.Thread(target=_countdown_monitor, daemon=True).start()
 
     def _execute_sell(
         order_qty: Optional[float],
