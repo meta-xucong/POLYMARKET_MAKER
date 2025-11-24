@@ -1660,7 +1660,7 @@ def main():
     else:
         sell_mode = "aggressive"
         print("[INIT] 已选择激进卖出分支。")
-    print("请输入买入触发价（对标 ask，如 0.35，留空表示仅依赖跌幅触发）：")
+    print("请输入买入触发价（对标 bid，如 0.35，留空表示仅依赖跌幅触发）：")
     buy_px_in = input().strip()
     buy_threshold = None
     if buy_px_in:
