@@ -1982,10 +1982,23 @@ def main():
                 time.sleep(1)
 
     def _activate_sell_only(reason: str) -> None:
-        if not sell_only_event.is_set():
-            sell_only_event.set()
-            strategy.enable_sell_only(reason)
-            print("[COUNTDOWN] 已进入仅卖出模式：倒计时窗口内不再买入。")
+        nonlocal exit_after_sell_only_clear
+        if sell_only_event.is_set():
+            return
+
+        sell_only_event.set()
+        strategy.enable_sell_only(reason)
+        _maybe_refresh_position_size("[COUNTDOWN] 进入仅卖出模式前同步持仓", force=True)
+        has_position = _has_actionable_position()
+
+        print("[COUNTDOWN] 已进入仅卖出模式：倒计时窗口内不再买入。")
+        if has_position:
+            exit_after_sell_only_clear = True
+            print("[COUNTDOWN] 仍有持仓，将继续等待卖出，清仓后停止脚本。")
+        else:
+            print("[COUNTDOWN] 当前无持仓，倒计时仅卖出模式下直接停止脚本。")
+            strategy.stop("countdown sell-only window (flat)")
+            stop_event.set()
 
     def _countdown_monitor():
         if not market_deadline_ts:
@@ -2138,6 +2151,17 @@ def main():
             return False
         return True
 
+    def _has_actionable_position(status_snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        status_snapshot = status_snapshot or strategy.status()
+        dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
+        for candidate in (position_size, _extract_position_size(status_snapshot)):
+            try:
+                if candidate is not None and float(candidate) > dust_floor:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+
     position_size: Optional[float] = None
     last_order_size: Optional[float] = None
     status_snapshot = strategy.status()
@@ -2157,6 +2181,7 @@ def main():
     short_buy_cooldown = 1.0
     next_position_sync: float = 0.0
     awaiting_buy_passthrough: bool = True
+    exit_after_sell_only_clear: bool = False
 
     def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
         nonlocal position_size, next_position_sync
@@ -2423,6 +2448,17 @@ def main():
 
             if now >= next_position_sync:
                 _maybe_refresh_position_size("[LOOP]")
+
+            if sell_only_event.is_set() and exit_after_sell_only_clear:
+                status = strategy.status()
+                awaiting = status.get("awaiting")
+                awaiting_val = getattr(awaiting, "value", awaiting)
+                awaiting_is_sell = awaiting_val == ActionType.SELL
+                if not _has_actionable_position(status) and not awaiting_is_sell:
+                    print("[COUNTDOWN] 倒计时仅卖出模式下已清仓，脚本将退出。")
+                    strategy.stop("countdown sell-only cleared position")
+                    stop_event.set()
+                    break
 
             if last_log is None or now - last_log >= 1.0:
                 snap = latest.get(token_id) or {}
