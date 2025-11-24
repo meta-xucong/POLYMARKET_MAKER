@@ -1694,16 +1694,30 @@ def main():
         print("[ERR] 盈利百分比非法，退出。")
         return
 
-    incremental_choice = _prompt_yes_or_no(
-        '是否启用“每次卖出后下一轮买入 +1%”功能？输入 y 表示开启，输入 n 表示关闭（默认 y）：'
+    print(
+        "是否在每次卖出后抬升下一轮买入的跌幅阈值？"
+        "输入数字（单位%），如 0.1 表示每轮+0.1%；"
+        "直接回车表示不启用递增。"
     )
-    if incremental_choice is None:
-        return
-    enable_incremental_drop_pct = incremental_choice
-    if enable_incremental_drop_pct:
-        print("[INIT] 已启用卖出后递增买入阈值功能。")
+    incremental_step_raw = input().strip()
+    incremental_drop_pct_step = 0.0
+    enable_incremental_drop_pct = False
+    if incremental_step_raw:
+        try:
+            incremental_step_pct = float(incremental_step_raw)
+        except Exception:
+            print("[ERR] 跌幅递增输入非法，退出。")
+            return
+        if incremental_step_pct <= 0:
+            print("[ERR] 跌幅递增数值需大于 0，退出。")
+            return
+        incremental_drop_pct_step = incremental_step_pct / 100.0
+        enable_incremental_drop_pct = True
+        print(
+            f"[INIT] 已启用卖出后递增买入阈值功能，步长 {incremental_step_pct:.4f}% 。"
+        )
     else:
-        print("[INIT] 已关闭卖出后递增买入阈值功能。")
+        print("[INIT] 未设定递增跌幅阈值，保持固定阈值运行。")
 
     sell_only_start_ts: Optional[float] = None
     countdown_timezone_hint = tz_hint
@@ -1757,6 +1771,7 @@ def main():
         profit_pct=profit_pct,
         disable_sell_signals=True,
         enable_incremental_drop_pct=enable_incremental_drop_pct,
+        incremental_drop_pct_step=incremental_drop_pct_step,
     )
     strategy = VolArbStrategy(cfg)
     strategy_supports_total_position = _strategy_accepts_total_position(strategy)
