@@ -1694,14 +1694,13 @@ def main():
         print("[ERR] 盈利百分比非法，退出。")
         return
 
-    default_incremental_step_pct = 0.1
     print(
         "是否在每次卖出后抬升下一轮买入的跌幅阈值？"
-        f"输入数字（单位%），如 0.1 表示每轮+0.1%，默认 {default_incremental_step_pct}%；"
+        "输入数字（单位%），如 0.1 表示每轮+0.1%；"
         "直接回车表示不启用递增。"
     )
     incremental_step_raw = input().strip()
-    incremental_drop_pct_step = default_incremental_step_pct / 100.0
+    incremental_drop_pct_step = 0.0
     enable_incremental_drop_pct = False
     if incremental_step_raw:
         try:

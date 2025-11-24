@@ -32,8 +32,8 @@ class StrategyConfig:
     profit_pct: Optional[float] = 0.05
     max_history_points: int = 600
 
-    # 卖出后动态抬升跌幅阈值（默认启用，默认步长 0.1%）
-    enable_incremental_drop_pct: bool = True
+    # 卖出后动态抬升跌幅阈值（默认关闭，如需开启请设定步长）
+    enable_incremental_drop_pct: bool = False
     incremental_drop_pct_step: float = 0.001
     incremental_drop_pct_cap: float = 0.20
 
