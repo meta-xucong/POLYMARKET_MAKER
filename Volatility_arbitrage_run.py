@@ -1996,6 +1996,85 @@ def main():
                     return
                 time.sleep(1)
 
+    position_size: Optional[float] = None
+    last_order_size: Optional[float] = None
+    status_snapshot = strategy.status()
+    initial_pos = _extract_position_size(status_snapshot)
+    if initial_pos > 0:
+        position_size = initial_pos
+        last_order_size = initial_pos
+    max_position_cap: Optional[float] = None
+    if manual_order_size is not None and manual_size_is_target:
+        try:
+            max_position_cap = max(float(manual_order_size), 0.0)
+        except (TypeError, ValueError):
+            max_position_cap = None
+    last_log: Optional[float] = None
+    buy_cooldown_until: float = 0.0
+    pending_buy: Optional[Action] = None
+    short_buy_cooldown = 1.0
+    next_position_sync: float = 0.0
+    awaiting_buy_passthrough: bool = True
+    exit_after_sell_only_clear: bool = False
+
+    def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
+        nonlocal position_size, next_position_sync
+        now = time.time()
+        if not force and now < next_position_sync:
+            return
+        next_position_sync = now + POSITION_SYNC_INTERVAL
+        try:
+            avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+        except Exception as probe_exc:
+            print(f"[WATCHDOG][POSITION] {reason} 持仓查询异常：{probe_exc}")
+            return
+
+        status_snapshot = strategy.status()
+        current_state = status_snapshot.get("state")
+        awaiting = status_snapshot.get("awaiting")
+        awaiting_is_sell = False
+        if awaiting is not None:
+            awaiting_val = getattr(awaiting, "value", awaiting)
+            awaiting_is_sell = awaiting_val == ActionType.SELL
+        has_local_position = _extract_position_size(status_snapshot) > 0
+        eps = 1e-6
+        dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
+        new_size, changed = _merge_remote_position_size(
+            position_size, total_pos, dust_floor=dust_floor
+        )
+        position_size = new_size
+        should_sync_state = changed
+
+        if not should_sync_state:
+            # 即便仓位未变动，也要校正策略状态：
+            #  - 远端有仓位但策略仍为 FLAT；
+            #  - 远端无仓位但策略仍为 LONG。
+            should_sync_state = (
+                (new_size is not None and current_state != "LONG")
+                or (new_size is None and (current_state != "FLAT" or has_local_position))
+            )
+
+        def _update_state(target_state: str) -> None:
+            if current_state == target_state:
+                return
+            try:
+                strategy.set_state(target_state)
+            except Exception as sync_exc:
+                print(
+                    f"[WATCHDOG][POSITION] {reason} 同步策略状态到 {target_state} 失败：{sync_exc}"
+                )
+
+        if should_sync_state:
+            if new_size is not None and not math.isclose(new_size, 0.0, abs_tol=eps):
+                _update_state("LONG")
+                if awaiting_is_sell:
+                    strategy.override_awaiting(None)
+                strategy.cache_avg_price(avg_px, origin_note)
+            else:
+                _update_state("FLAT")
+                if has_local_position:
+                    strategy.reset_position()
+
     def _activate_sell_only(reason: str) -> None:
         nonlocal exit_after_sell_only_clear
         if sell_only_event.is_set():
