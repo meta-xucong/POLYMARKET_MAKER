@@ -56,7 +56,7 @@ class Action:
     action: ActionType
     token_id: str
     reason: str
-    ref_price: float                 # 触发时参考的行情价：BUY 用 best_ask，SELL 用 best_bid
+    ref_price: float                 # 触发时参考的行情价：BUY 用 best_bid，SELL 用 best_bid
     target_price: Optional[float] = None  # SELL 时为 entry * (1 + profit_pct)
     extra: Dict[str, Any] = field(default_factory=dict)
 
@@ -64,7 +64,7 @@ class Action:
 class VolArbStrategy:
     """
     极简策略状态机（单 token）——严格“确认后换态”版：
-      - FLAT → 当 best_ask <= buy_price_threshold 时，发出 BUY；
+      - FLAT → 当 best_bid <= buy_price_threshold 时，发出 BUY；
       - LONG → 当 best_bid >= entry_price * (1 + profit_ratio) 时，发出 SELL。
 
     注：
@@ -151,7 +151,7 @@ class VolArbStrategy:
             return None
 
         if self._state == "FLAT":
-            return self._maybe_buy(price_for_drop, best_ask, ts)
+            return self._maybe_buy(price_for_drop, best_bid, ts)
 
         elif self._state == "LONG":
             return self._maybe_sell(best_bid, ts)
@@ -159,7 +159,7 @@ class VolArbStrategy:
         return None
 
     # ------------------------ 买入/卖出触发判定 ------------------------
-    def _maybe_buy(self, drop_price: float, best_ask: float, ts: Optional[float]) -> Optional[Action]:
+    def _maybe_buy(self, drop_price: float, best_bid: float, ts: Optional[float]) -> Optional[Action]:
         if self._awaiting == ActionType.BUY and self.cfg.disable_duplicate_signal:
             return None  # 等待上游确认，不重复发 BUY
 
@@ -173,7 +173,7 @@ class VolArbStrategy:
 
         threshold_trigger = (
             self.cfg.buy_price_threshold is not None
-            and best_ask <= self.cfg.buy_price_threshold
+            and best_bid <= self.cfg.buy_price_threshold
         )
 
         if not drop_trigger and not threshold_trigger:
@@ -202,14 +202,14 @@ class VolArbStrategy:
 
         if threshold_trigger and self.cfg.buy_price_threshold is not None:
             reasons.append(
-                f"best_ask({best_ask:.5f}) ≤ buy_threshold({self.cfg.buy_price_threshold:.5f})"
+                f"best_bid({best_bid:.5f}) ≤ buy_threshold({self.cfg.buy_price_threshold:.5f})"
             )
 
         act = Action(
             action=ActionType.BUY,
             token_id=self.cfg.token_id,
             reason="; ".join(reasons) or "drop trigger",
-            ref_price=best_ask,
+            ref_price=best_bid,
             extra=extra,
         )
         self._last_signal = ActionType.BUY
