@@ -2077,9 +2077,6 @@ def main():
 
     print("[RUN] 监听行情中… 输入 stop / exit 可手动停止。")
 
-    if sell_only_start_ts and time.time() >= sell_only_start_ts:
-        _activate_sell_only("countdown window")
-
     if market_deadline_ts:
         threading.Thread(target=_countdown_monitor, daemon=True).start()
 
@@ -2278,6 +2275,9 @@ def main():
                     _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
             except Exception as exc:
                 print(f"[WATCHDOG][POSITION] 自动卖出旧仓位失败：{exc}")
+
+    if sell_only_start_ts and time.time() >= sell_only_start_ts:
+        _activate_sell_only("countdown window")
 
     def _execute_sell(
         order_qty: Optional[float],
