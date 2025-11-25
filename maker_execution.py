@@ -638,9 +638,11 @@ def maker_buy_follow_bid(
                 )
         if filled_total > previous_filled_total + _MIN_FILL_EPS:
             no_fill_poll_count = 0
-        else:
+        elif shortage_retry_count > 0:
             no_fill_poll_count += 1
-        if no_fill_poll_count >= 30:
+        else:
+            no_fill_poll_count = 0
+        if shortage_retry_count > 0 and no_fill_poll_count >= 30:
             print(
                 "[MAKER][BUY] 挂单连续 30 次未检测到新增成交，强制校对仓位/余额后重挂。"
             )
