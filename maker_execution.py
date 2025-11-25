@@ -999,6 +999,46 @@ def maker_sell_follow_ask_with_floor_wait(
                     keyword in msg for keyword in ("insufficient", "balance", "position")
                 )
                 if insufficient:
+                    forced_remaining: Optional[float] = None
+                    if position_fetcher:
+                        try:
+                            live_position = position_fetcher()
+                        except Exception as fetch_exc:
+                            print(f"[MAKER][SELL] 强制刷新仓位失败：{fetch_exc}")
+                            live_position = None
+                        if live_position is not None:
+                            try:
+                                live_target = max(
+                                    _floor_to_dp(float(live_position), SELL_SIZE_DP), 0.0
+                                )
+                            except (TypeError, ValueError):
+                                live_target = None
+                            if live_target is not None:
+                                refreshed_goal = max(filled_total + live_target, filled_total)
+                                forced_remaining = max(refreshed_goal - filled_total, 0.0)
+                                if forced_remaining >= 0.01 and (
+                                    not api_min_qty or forced_remaining + _MIN_FILL_EPS >= api_min_qty
+                                ):
+                                    print(
+                                        "[MAKER][SELL] 可用仓位不足，刷新后改用实际仓位 -> "
+                                        f"remain={forced_remaining:.{SELL_SIZE_DP}f}"
+                                    )
+                                    goal_size = refreshed_goal
+                                    remaining = forced_remaining
+                                    shortage_retry_count = 0
+                                    continue
+                    if forced_remaining is not None and (
+                        forced_remaining < 0.01
+                        or (api_min_qty and forced_remaining + _MIN_FILL_EPS < api_min_qty)
+                    ):
+                        final_status = (
+                            "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
+                        )
+                        remaining = max(goal_size - filled_total, 0.0)
+                        print(
+                            "[MAKER][SELL] 仓位刷新后已无可交易数量，退出卖出流程。"
+                        )
+                        break
                     shortage_retry_count += 1
                     if shortage_retry_count > 100 and shrink_tick < 0.1 - 1e-12:
                         shrink_tick = 0.1
