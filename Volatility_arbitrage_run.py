@@ -2125,6 +2125,26 @@ def main():
     min_loop_interval = 1.0
     next_loop_after = 0.0
 
+    def _reconcile_empty_long_state(reason: str) -> None:
+        nonlocal position_size
+
+        status_snapshot = strategy.status()
+        state = status_snapshot.get("state")
+        awaiting = status_snapshot.get("awaiting")
+        if state != "LONG" or awaiting is not None:
+            return
+
+        if _has_actionable_position(status_snapshot):
+            return
+
+        latest_bid = _latest_best_bid()
+        fallback_px = latest_bid if latest_bid is not None else 0.0
+        position_size = None
+        print(
+            f"[STATE][RECONCILE] {reason} 检测到 LONG 无持仓，强制归零 (fallback_px={fallback_px:.4f})"
+        )
+        strategy.on_sell_filled(avg_price=fallback_px, remaining=0.0)
+
     def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
         nonlocal position_size, next_position_sync
         now = time.time()
@@ -2202,6 +2222,8 @@ def main():
             )
             try:
                 if position_size is not None:
+                    strategy.mark_awaiting(ActionType.SELL)
+                    print("[STATE] 同步远端持仓后，标记等待卖出以避免误入买入分支。")
                     _execute_sell(position_size, floor_hint=fallback_px, source="[POSITION][SYNC]")
             except Exception as exc:
                 print(f"[WATCHDOG][POSITION] 自动卖出旧仓位失败：{exc}")
@@ -2471,6 +2493,8 @@ def main():
 
                 if now >= next_position_sync:
                     _maybe_refresh_position_size("[LOOP]")
+
+                _reconcile_empty_long_state("[LOOP]")
 
                 if sell_only_event.is_set() and exit_after_sell_only_clear:
                     status = strategy.status()
