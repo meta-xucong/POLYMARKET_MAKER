@@ -1089,6 +1089,9 @@ def maker_sell_follow_ask_with_floor_wait(
                         break
                     shortage_retry_count += 1
                     if shortage_retry_count >= 30 and position_fetcher:
+                        print(
+                            "[MAKER][SELL] 连续30次仓位不足，触发强制仓位查询以确认剩余持仓。"
+                        )
                         try:
                             refreshed_position = position_fetcher()
                         except Exception as exc:
@@ -1153,6 +1156,8 @@ def maker_sell_follow_ask_with_floor_wait(
                     break
                 raise
             order_id = str(response.get("orderId"))
+            if shortage_retry_count:
+                shortage_retry_count = 0
             record = {
                 "id": order_id,
                 "side": "sell",
