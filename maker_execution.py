@@ -1088,6 +1088,45 @@ def maker_sell_follow_ask_with_floor_wait(
                         )
                         break
                     shortage_retry_count += 1
+                    if shortage_retry_count >= 30 and position_fetcher:
+                        try:
+                            refreshed_position = position_fetcher()
+                        except Exception as exc:
+                            print(f"[MAKER][SELL] 仓位刷新失败（短缺重试）：{exc}")
+                            refreshed_position = None
+                        refreshed_goal: Optional[float] = None
+                        if refreshed_position is not None:
+                            try:
+                                refreshed_size = max(
+                                    _floor_to_dp(float(refreshed_position), SELL_SIZE_DP), 0.0
+                                )
+                                refreshed_goal = max(filled_total + refreshed_size, filled_total)
+                            except (TypeError, ValueError):
+                                refreshed_goal = None
+                        if refreshed_goal is not None:
+                            refreshed_remaining = max(refreshed_goal - filled_total, 0.0)
+                            if refreshed_remaining < 0.01 or (
+                                api_min_qty and refreshed_remaining + _MIN_FILL_EPS < api_min_qty
+                            ):
+                                final_status = (
+                                    "FILLED_TRUNCATED"
+                                    if filled_total > _MIN_FILL_EPS
+                                    else "SKIPPED_TOO_SMALL"
+                                )
+                                remaining = max(goal_size - filled_total, 0.0)
+                                print(
+                                    "[MAKER][SELL] 连续30次仓位不足后刷新发现已无持仓，结束卖出流程。"
+                                )
+                                break
+                            if abs(refreshed_goal - goal_size) > _MIN_FILL_EPS:
+                                goal_size = refreshed_goal
+                                remaining = refreshed_remaining
+                                shortage_retry_count = 0
+                                print(
+                                    "[MAKER][SELL] 连续30次仓位不足后刷新仓位 -> "
+                                    f"remain={refreshed_remaining:.{SELL_SIZE_DP}f}"
+                                )
+                                continue
                     if shortage_retry_count > 100 and shrink_tick < 0.1 - 1e-12:
                         shrink_tick = 0.1
                     current_remaining = max(goal_size - filled_total, 0.0)
