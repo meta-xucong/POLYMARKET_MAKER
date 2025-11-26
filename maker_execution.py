@@ -394,7 +394,8 @@ def maker_buy_follow_bid(
     # 采用统一的两级缩减步长，先用 0.01，多次失败后升级到 0.1
     size_tick = 0.01
     shortage_retry_count = 0
-    min_shrink_interval = 0.1
+    base_min_shrink_interval = 1.0
+    min_shrink_interval = base_min_shrink_interval
     last_shrink_time = 0.0
 
     no_fill_poll_count = 0
@@ -449,10 +450,20 @@ def maker_buy_follow_bid(
         except Exception:
             return False
 
+    def _reset_shortage_recovery(note: str) -> None:
+        nonlocal shortage_retry_count, min_shrink_interval, last_shrink_time
+
+        if shortage_retry_count > 0 or min_shrink_interval != base_min_shrink_interval:
+            shortage_retry_count = 0
+            min_shrink_interval = base_min_shrink_interval
+            last_shrink_time = time.monotonic()
+            print(note)
+
     def _handle_balance_shortage(reason: str, min_viable: float) -> bool:
-        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time
+        nonlocal goal_size, remaining, active_order, active_price, final_status, shortage_retry_count, size_tick, last_shrink_time, min_shrink_interval
 
         print(reason)
+        min_shrink_interval = max(min_shrink_interval, base_min_shrink_interval)
         if active_order:
             _cancel_order(client, active_order)
             rec = records.get(active_order)
@@ -567,6 +578,7 @@ def maker_buy_follow_bid(
             accounted[order_id] = 0.0
             active_order = order_id
             active_price = px
+            _reset_shortage_recovery("[MAKER][BUY] 挂单成功，退出余额不足重试模式。")
             if progress_probe:
                 interval = max(progress_probe_interval, poll_sec, 1e-6)
                 try:
@@ -722,6 +734,8 @@ def maker_buy_follow_bid(
         cancel_states = {"CANCELLED", "CANCELED", "REJECTED", "EXPIRED"}
         invalid_states = {"INVALID"}
         status_shortage = _is_insufficient_balance(status_text) or _is_insufficient_balance(status_payload)
+        if shortage_retry_count > 0 and not status_shortage:
+            _reset_shortage_recovery("[MAKER][BUY] 状态恢复正常，退出余额不足重试模式。")
         if status_text_upper in invalid_states or status_shortage:
             reason = "[MAKER][BUY] 订单被撮合层标记为 INVALID，尝试调整买入目标后重试。"
             if status_shortage and status_text_upper not in invalid_states:
