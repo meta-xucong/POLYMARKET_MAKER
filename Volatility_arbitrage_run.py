@@ -2122,6 +2122,8 @@ def main():
     next_position_sync: float = 0.0
     awaiting_buy_passthrough: bool = True
     exit_after_sell_only_clear: bool = False
+    min_loop_interval = 1.0
+    next_loop_after = 0.0
 
     def _maybe_refresh_position_size(reason: str, *, force: bool = False) -> None:
         nonlocal position_size, next_position_sync
@@ -2266,6 +2268,11 @@ def main():
                 wait = min(remaining - 300, 60)
                 if wait <= 0:
                     wait = 1
+                deadline = time.time() + wait
+                while time.time() < deadline:
+                    if stop_event.is_set():
+                        return
+                    time.sleep(0.2)
 
     if sell_only_start_ts and time.time() >= sell_only_start_ts:
         _activate_sell_only("countdown window")
@@ -2420,413 +2427,426 @@ def main():
     try:
         while not stop_event.is_set():
             now = time.time()
-            if pending_buy is not None and now >= buy_cooldown_until:
-                if sell_only_event.is_set():
-                    print("[COUNTDOWN] 仍在仅卖出模式内，丢弃待执行的买入信号。")
-                    strategy.on_reject("sell-only window active")
-                    pending_buy = None
-                else:
-                    status = strategy.status()
-                    state = status.get("state")
-                    awaiting = status.get("awaiting")
-                    # 使用本地与策略两侧的持仓快照，避免残留仓位时误买
-                    dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
-                    strat_pos = status.get("position_size")
-                    has_position = False
-                    for pos in (position_size, strat_pos):
-                        if pos is not None and pos > dust_floor:
-                            has_position = True
-                            break
-
-                    awaiting_blocking = _awaiting_blocking(awaiting)
-                    if state != "FLAT" or awaiting_blocking or has_position:
-                        reason = (
-                            "cooldown ended but still in position"
-                            if has_position
-                            else "cooldown ended but state not FLAT"
-                        )
-                        print(
-                            "[COOLDOWN] 冷却结束但仍有持仓/非空等待状态，丢弃待执行的买入信号。"
-                        )
-                        strategy.on_reject(reason)
+            if now < next_loop_after:
+                wait = next_loop_after - now
+                if wait > 0 and stop_event.wait(wait):
+                    break
+            now = time.time()
+            loop_started = now
+            try:
+                if pending_buy is not None and now >= buy_cooldown_until:
+                    if sell_only_event.is_set():
+                        print("[COUNTDOWN] 仍在仅卖出模式内，丢弃待执行的买入信号。")
+                        strategy.on_reject("sell-only window active")
                         pending_buy = None
                     else:
-                        print("[COOLDOWN] 冷却结束，重新尝试买入…")
-                        action_queue.put(pending_buy)
-                        pending_buy = None
+                        status = strategy.status()
+                        state = status.get("state")
+                        awaiting = status.get("awaiting")
+                        # 使用本地与策略两侧的持仓快照，避免残留仓位时误买
+                        dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
+                        strat_pos = status.get("position_size")
+                        has_position = False
+                        for pos in (position_size, strat_pos):
+                            if pos is not None and pos > dust_floor:
+                                has_position = True
+                                break
 
-            if now >= next_position_sync:
-                _maybe_refresh_position_size("[LOOP]")
+                        awaiting_blocking = _awaiting_blocking(awaiting)
+                        if state != "FLAT" or awaiting_blocking or has_position:
+                            reason = (
+                                "cooldown ended but still in position"
+                                if has_position
+                                else "cooldown ended but state not FLAT"
+                            )
+                            print(
+                                "[COOLDOWN] 冷却结束但仍有持仓/非空等待状态，丢弃待执行的买入信号。"
+                            )
+                            strategy.on_reject(reason)
+                            pending_buy = None
+                        else:
+                            print("[COOLDOWN] 冷却结束，重新尝试买入…")
+                            action_queue.put(pending_buy)
+                            pending_buy = None
 
-            if sell_only_event.is_set() and exit_after_sell_only_clear:
-                status = strategy.status()
-                awaiting = status.get("awaiting")
-                awaiting_val = getattr(awaiting, "value", awaiting)
-                awaiting_is_sell = awaiting_val == ActionType.SELL
-                if not _has_actionable_position(status) and not awaiting_is_sell:
-                    print("[COUNTDOWN] 倒计时仅卖出模式下已清仓，脚本将退出。")
-                    strategy.stop("countdown sell-only cleared position")
-                    stop_event.set()
+                if now >= next_position_sync:
+                    _maybe_refresh_position_size("[LOOP]")
+
+                if sell_only_event.is_set() and exit_after_sell_only_clear:
+                    status = strategy.status()
+                    awaiting = status.get("awaiting")
+                    awaiting_val = getattr(awaiting, "value", awaiting)
+                    awaiting_is_sell = awaiting_val == ActionType.SELL
+                    if not _has_actionable_position(status) and not awaiting_is_sell:
+                        print("[COUNTDOWN] 倒计时仅卖出模式下已清仓，脚本将退出。")
+                        strategy.stop("countdown sell-only cleared position")
+                        stop_event.set()
+                        break
+
+                if last_log is None or now - last_log >= 1.0:
+                    snap = latest.get(token_id) or {}
+                    bid = float(snap.get("best_bid") or 0.0)
+                    ask = float(snap.get("best_ask") or 0.0)
+                    last_px = float(snap.get("price") or 0.0)
+                    st = strategy.status()
+                    awaiting = st.get("awaiting")
+                    awaiting_s = awaiting.value if hasattr(awaiting, "value") else awaiting
+                    entry_price = st.get("entry_price")
+                    print(
+                        f"[PX] bid={bid:.4f} ask={ask:.4f} last={last_px:.4f} | "
+                        f"state={st.get('state')} awaiting={awaiting_s} entry={entry_price}"
+                    )
+
+                    extra_lines: List[str] = []
+
+                    drop_stats = st.get("drop_stats") or {}
+                    config_snapshot = st.get("config") or {}
+                    history_len = st.get("price_history_len")
+                    history_display = history_len if history_len is not None else "-"
+                    window_seconds = drop_stats.get("window_seconds")
+                    extra_lines.append(
+                        "    时间窗口: "
+                        f"{_fmt_minutes(window_seconds)} | 采样点数: {history_display}"
+                    )
+
+                    drop_line = (
+                        "    窗口跌幅: 当前 "
+                        f"{_fmt_pct(drop_stats.get('current_drop_ratio'))} / 最大 "
+                        f"{_fmt_pct(drop_stats.get('max_drop_ratio'))} / 阈值 "
+                        f"{_fmt_pct(config_snapshot.get('drop_pct'))}"
+                    )
+                    extra_lines.append(drop_line)
+
+                    price_line = (
+                        "    窗口价格: 高 "
+                        f"{_fmt_price(drop_stats.get('window_high'))} / 低 "
+                        f"{_fmt_price(drop_stats.get('window_low'))}"
+                    )
+                    extra_lines.append(price_line)
+
+                    if st.get("sell_only"):
+                        extra_lines.append("    状态：倒计时仅卖出模式（禁止买入）")
+                    for line in extra_lines:
+                        print(line)
+                    last_log = now
+
+                try:
+                    action = action_queue.get(timeout=0.5)
+                except Empty:
+                    action = None
+
+                if stop_event.is_set():
                     break
 
-            if last_log is None or now - last_log >= 1.0:
+                if action is None:
+                    continue
+
                 snap = latest.get(token_id) or {}
                 bid = float(snap.get("best_bid") or 0.0)
                 ask = float(snap.get("best_ask") or 0.0)
-                last_px = float(snap.get("price") or 0.0)
-                st = strategy.status()
-                awaiting = st.get("awaiting")
-                awaiting_s = awaiting.value if hasattr(awaiting, "value") else awaiting
-                entry_price = st.get("entry_price")
-                print(
-                    f"[PX] bid={bid:.4f} ask={ask:.4f} last={last_px:.4f} | "
-                    f"state={st.get('state')} awaiting={awaiting_s} entry={entry_price}"
-                )
-
-                extra_lines: List[str] = []
-
-                drop_stats = st.get("drop_stats") or {}
-                config_snapshot = st.get("config") or {}
-                history_len = st.get("price_history_len")
-                history_display = history_len if history_len is not None else "-"
-                window_seconds = drop_stats.get("window_seconds")
-                extra_lines.append(
-                    "    时间窗口: "
-                    f"{_fmt_minutes(window_seconds)} | 采样点数: {history_display}"
-                )
-
-                drop_line = (
-                    "    窗口跌幅: 当前 "
-                    f"{_fmt_pct(drop_stats.get('current_drop_ratio'))} / 最大 "
-                    f"{_fmt_pct(drop_stats.get('max_drop_ratio'))} / 阈值 "
-                    f"{_fmt_pct(config_snapshot.get('drop_pct'))}"
-                )
-                extra_lines.append(drop_line)
-
-                price_line = (
-                    "    窗口价格: 高 "
-                    f"{_fmt_price(drop_stats.get('window_high'))} / 低 "
-                    f"{_fmt_price(drop_stats.get('window_low'))}"
-                )
-                extra_lines.append(price_line)
-
-                if st.get("sell_only"):
-                    extra_lines.append("    状态：倒计时仅卖出模式（禁止买入）")
-                for line in extra_lines:
-                    print(line)
-                last_log = now
-
-            try:
-                action = action_queue.get(timeout=0.5)
-            except Empty:
-                continue
-
-            if stop_event.is_set():
-                break
-
-            snap = latest.get(token_id) or {}
-            bid = float(snap.get("best_bid") or 0.0)
-            ask = float(snap.get("best_ask") or 0.0)
-
-            if (
-                not manual_deadline_disabled
-                and not market_closed_detected
-                and market_meta
-                and _market_has_ended(market_meta, now)
-            ):
-                print("[MARKET] 达到市场截止时间，准备退出…")
-                market_closed_detected = True
-                strategy.stop("market ended")
-                stop_event.set()
-                continue
-
-            if action.action == ActionType.SELL:
-                floor_override = action.target_price
-                _execute_sell(position_size, floor_hint=floor_override, source="[SIGNAL]")
-                continue
-
-            if action.action != ActionType.BUY:
-                print(f"[WARN] 收到未预期的动作 {action.action}，已忽略。")
-                continue
-
-            if sell_only_event.is_set():
-                print("[COUNTDOWN] 当前处于倒计时仅卖出模式，忽略买入信号。")
-                strategy.on_reject("sell-only window active")
-                continue
-
-            status = strategy.status()
-            dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
-            current_state = status.get("state")
-            awaiting = status.get("awaiting")
-            strat_pos = status.get("position_size")
-            raw_position: Optional[float] = None
-            actionable_position: Optional[float] = None
-            treat_as_dust: bool = False
-            for pos in (position_size, strat_pos):
-                try:
-                    val = float(pos)
-                except (TypeError, ValueError):
+    
+                if (
+                    not manual_deadline_disabled
+                    and not market_closed_detected
+                    and market_meta
+                    and _market_has_ended(market_meta, now)
+                ):
+                    print("[MARKET] 达到市场截止时间，准备退出…")
+                    market_closed_detected = True
+                    strategy.stop("market ended")
+                    stop_event.set()
                     continue
-                if val <= 0:
+    
+                if action.action == ActionType.SELL:
+                    floor_override = action.target_price
+                    _execute_sell(position_size, floor_hint=floor_override, source="[SIGNAL]")
                     continue
-                raw_position = max(raw_position or 0.0, val)
-            if raw_position is not None:
-                if raw_position > dust_floor:
-                    actionable_position = raw_position
-                else:
-                    treat_as_dust = True
-
-            if actionable_position is not None:
-                print(
-                    f"[BUY][BLOCK] 检测到可卖出仓位 {actionable_position:.4f}，先清仓后再尝试买入。"
-                )
-                pending_buy = action
-                buy_cooldown_until = time.time() + short_buy_cooldown
-                _execute_sell(actionable_position, floor_hint=None, source="[BUY][BLOCK]")
-                continue
-
-            if treat_as_dust:
-                fallback_px = bid if bid > 0 else ask
-                strategy.on_sell_filled(avg_price=fallback_px or 0.0, remaining=0.0)
-                position_size = None
-                last_order_size = None
-                print(
-                    f"[BUY][DUST] 检测到尘埃仓位 {raw_position:.4f} < 最小挂单量 {dust_floor:.2f}，忽略并继续买入。"
-                )
+    
+                if action.action != ActionType.BUY:
+                    print(f"[WARN] 收到未预期的动作 {action.action}，已忽略。")
+                    continue
+    
+                if sell_only_event.is_set():
+                    print("[COUNTDOWN] 当前处于倒计时仅卖出模式，忽略买入信号。")
+                    strategy.on_reject("sell-only window active")
+                    continue
+    
                 status = strategy.status()
+                dust_floor = max(API_MIN_ORDER_SIZE or 0.0, 1e-4)
                 current_state = status.get("state")
                 awaiting = status.get("awaiting")
-
-            awaiting_blocking = _awaiting_blocking(awaiting)
-            if current_state != "FLAT" or awaiting_blocking:
-                _maybe_refresh_position_size("[BUY][STATE-SYNC]", force=True)
-                status = strategy.status()
-                current_state = status.get("state")
-                awaiting = status.get("awaiting")
-                awaiting_blocking = _awaiting_blocking(awaiting)
-
-                # 强制兜底：
-                # 1) 若策略仍认为持仓但本地/策略均无可用仓位，直接同步为空仓；
-                # 2) 若存在遗留的 BUY 待确认，自动解除阻塞。
-                combined_pos = _extract_position_size(status)
-                local_pos_candidates = [position_size, strat_pos]
-                for pos in local_pos_candidates:
+                strat_pos = status.get("position_size")
+                raw_position: Optional[float] = None
+                actionable_position: Optional[float] = None
+                treat_as_dust: bool = False
+                for pos in (position_size, strat_pos):
                     try:
-                        numeric = float(pos) if pos is not None else 0.0
+                        val = float(pos)
                     except (TypeError, ValueError):
                         continue
-                    if numeric > combined_pos:
-                        combined_pos = numeric
-
-                if current_state != "FLAT" and (combined_pos is None or combined_pos <= dust_floor):
+                    if val <= 0:
+                        continue
+                    raw_position = max(raw_position or 0.0, val)
+                if raw_position is not None:
+                    if raw_position > dust_floor:
+                        actionable_position = raw_position
+                    else:
+                        treat_as_dust = True
+    
+                if actionable_position is not None:
+                    print(
+                        f"[BUY][BLOCK] 检测到可卖出仓位 {actionable_position:.4f}，先清仓后再尝试买入。"
+                    )
+                    pending_buy = action
+                    buy_cooldown_until = time.time() + short_buy_cooldown
+                    _execute_sell(actionable_position, floor_hint=None, source="[BUY][BLOCK]")
+                    continue
+    
+                if treat_as_dust:
                     fallback_px = bid if bid > 0 else ask
                     strategy.on_sell_filled(avg_price=fallback_px or 0.0, remaining=0.0)
                     position_size = None
                     last_order_size = None
+                    print(
+                        f"[BUY][DUST] 检测到尘埃仓位 {raw_position:.4f} < 最小挂单量 {dust_floor:.2f}，忽略并继续买入。"
+                    )
+                    status = strategy.status()
+                    current_state = status.get("state")
+                    awaiting = status.get("awaiting")
+    
+                awaiting_blocking = _awaiting_blocking(awaiting)
+                if current_state != "FLAT" or awaiting_blocking:
+                    _maybe_refresh_position_size("[BUY][STATE-SYNC]", force=True)
                     status = strategy.status()
                     current_state = status.get("state")
                     awaiting = status.get("awaiting")
                     awaiting_blocking = _awaiting_blocking(awaiting)
-
-                if awaiting_blocking:
-                    awaiting_val = getattr(awaiting, "value", awaiting)
-                    if awaiting_val == ActionType.BUY:
-                        strategy.on_reject("auto-clear stale awaiting BUY")
+    
+                    # 强制兜底：
+                    # 1) 若策略仍认为持仓但本地/策略均无可用仓位，直接同步为空仓；
+                    # 2) 若存在遗留的 BUY 待确认，自动解除阻塞。
+                    combined_pos = _extract_position_size(status)
+                    local_pos_candidates = [position_size, strat_pos]
+                    for pos in local_pos_candidates:
+                        try:
+                            numeric = float(pos) if pos is not None else 0.0
+                        except (TypeError, ValueError):
+                            continue
+                        if numeric > combined_pos:
+                            combined_pos = numeric
+    
+                    if current_state != "FLAT" and (combined_pos is None or combined_pos <= dust_floor):
+                        fallback_px = bid if bid > 0 else ask
+                        strategy.on_sell_filled(avg_price=fallback_px or 0.0, remaining=0.0)
+                        position_size = None
+                        last_order_size = None
                         status = strategy.status()
                         current_state = status.get("state")
                         awaiting = status.get("awaiting")
                         awaiting_blocking = _awaiting_blocking(awaiting)
-
-                if current_state != "FLAT" or awaiting_blocking:
+    
+                    if awaiting_blocking:
+                        awaiting_val = getattr(awaiting, "value", awaiting)
+                        if awaiting_val == ActionType.BUY:
+                            strategy.on_reject("auto-clear stale awaiting BUY")
+                            status = strategy.status()
+                            current_state = status.get("state")
+                            awaiting = status.get("awaiting")
+                            awaiting_blocking = _awaiting_blocking(awaiting)
+    
+                    if current_state != "FLAT" or awaiting_blocking:
+                        print(
+                            "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
+                        )
+                        strategy.on_reject("state not flat or position exists")
+                        continue
+                now_for_buy = time.time()
+                if now_for_buy < buy_cooldown_until:
+                    remaining = buy_cooldown_until - now_for_buy
                     print(
-                        "[BUY][SKIP] 当前状态非 FLAT 或仍有持仓/待确认订单，丢弃买入信号。"
+                        f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
                     )
-                    strategy.on_reject("state not flat or position exists")
+                    pending_buy = action
                     continue
-            now_for_buy = time.time()
-            if now_for_buy < buy_cooldown_until:
-                remaining = buy_cooldown_until - now_for_buy
-                print(
-                    f"[COOLDOWN] 买入冷却中，剩余 {remaining:.1f}s 再尝试买入。"
-                )
-                pending_buy = action
-                continue
-
-            if max_position_cap is not None:
-                _maybe_refresh_position_size("[BUY][PRE]", force=True)
-
-            ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
-            if manual_order_size is not None:
-                probed_size, origin_display = _probe_position_size_for_buy()
-                current_position = probed_size
-                if current_position is None:
-                    current_position = position_size
-                else:
-                    position_size = current_position
-                owned = max(float(current_position or 0.0), 0.0)
-                planned_size, skip_manual = _plan_manual_buy_size(
-                    manual_order_size,
-                    owned,
-                    enforce_target=manual_size_is_target,
-                )
-                if skip_manual:
-                    origin_note = origin_display or "positions"
-                    print(
-                        f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
-                    )
-                    if max_position_cap is not None:
-                        _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
-                    strategy.on_reject("manual target already satisfied")
-                    continue
-                if planned_size is None or planned_size <= 0:
-                    print("[WARN] 手动份数解析异常，跳过本次买入。")
-                    strategy.on_reject("invalid manual size")
-                    continue
-                order_size = planned_size
+    
                 if max_position_cap is not None:
-                    remaining_cap = max(max_position_cap - owned, 0.0)
-                    if remaining_cap <= 0:
+                    _maybe_refresh_position_size("[BUY][PRE]", force=True)
+    
+                ref_price = action.ref_price or ask or float(snap.get("price") or 0.0)
+                if manual_order_size is not None:
+                    probed_size, origin_display = _probe_position_size_for_buy()
+                    current_position = probed_size
+                    if current_position is None:
+                        current_position = position_size
+                    else:
+                        position_size = current_position
+                    owned = max(float(current_position or 0.0), 0.0)
+                    planned_size, skip_manual = _plan_manual_buy_size(
+                        manual_order_size,
+                        owned,
+                        enforce_target=manual_size_is_target,
+                    )
+                    if skip_manual:
                         origin_note = origin_display or "positions"
                         print(
-                            f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已达到封顶 {max_position_cap:.4f}，跳过本次买入。"
+                            f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已满足手动目标 {manual_order_size:.4f}，跳过本次买入。"
                         )
-                        _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
-                        strategy.on_reject("position cap reached")
+                        if max_position_cap is not None:
+                            _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
+                        strategy.on_reject("manual target already satisfied")
                         continue
-                    if order_size > remaining_cap:
+                    if planned_size is None or planned_size <= 0:
+                        print("[WARN] 手动份数解析异常，跳过本次买入。")
+                        strategy.on_reject("invalid manual size")
+                        continue
+                    order_size = planned_size
+                    if max_position_cap is not None:
+                        remaining_cap = max(max_position_cap - owned, 0.0)
+                        if remaining_cap <= 0:
+                            origin_note = origin_display or "positions"
+                            print(
+                                f"[SKIP][BUY] 当前仓位({origin_note}) {owned:.4f} 已达到封顶 {max_position_cap:.4f}，跳过本次买入。"
+                            )
+                            _maybe_refresh_position_size("[BUY][CAP-SYNC]", force=True)
+                            strategy.on_reject("position cap reached")
+                            continue
+                        if order_size > remaining_cap:
+                            print(
+                                f"[HINT][BUY] 按封顶 {max_position_cap:.4f} 调整下单量 {order_size:.4f} -> {remaining_cap:.4f}"
+                            )
+                            order_size = remaining_cap
+                    origin_hint = f"({origin_display})" if origin_display else ""
+                    if manual_size_is_target:
                         print(
-                            f"[HINT][BUY] 按封顶 {max_position_cap:.4f} 调整下单量 {order_size:.4f} -> {remaining_cap:.4f}"
-                        )
-                        order_size = remaining_cap
-                origin_hint = f"({origin_display})" if origin_display else ""
-                if manual_size_is_target:
-                    print(
-                        f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位{origin_hint} {owned:.4f} -> 本次下单 {order_size:.4f}"
-                    )
-                else:
-                    if owned > 0:
-                        print(
-                            f"[HINT][BUY] 当前仓位{origin_hint} {owned:.4f}，但按手动份数 {order_size:.4f} 下单。"
+                            f"[HINT][BUY] 目标 {manual_order_size:.4f} - 当前仓位{origin_hint} {owned:.4f} -> 本次下单 {order_size:.4f}"
                         )
                     else:
-                        print(f"[HINT][BUY] 手动份数 -> 本次下单 {order_size:.4f}")
-            else:
-                order_size = _calc_size_by_1dollar(ref_price)
-                print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
-
-            def _buy_progress_probe() -> None:
-                try:
-                    avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
-                except Exception as probe_exc:
-                    print(f"[WATCHDOG][BUY] 持仓查询异常：{probe_exc}")
-                    return
-                origin_display = origin_note or "positions"
-                if total_pos is None or total_pos <= 0:
-                    print(f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} 当前无持仓")
-                    return
-                avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
-                print(
-                    f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
-                )
-
-            baseline_position = float(position_size or 0.0)
-
-            def _buy_fill_delta_probe() -> Optional[float]:
-                try:
-                    _, latest_pos, _ = _lookup_position_avg_price(client, token_id)
-                except Exception as probe_exc:
-                    print(f"[WATCHDOG][BUY] 持仓校对异常：{probe_exc}")
-                    return None
-                if latest_pos is None:
-                    return None
-                return max(float(latest_pos) - baseline_position, 0.0)
-
-            if awaiting_buy_passthrough:
-                awaiting_buy_passthrough = False
-            try:
-                buy_resp = maker_buy_follow_bid(
-                    client=client,
-                    token_id=token_id,
-                    target_size=order_size,
-                    poll_sec=10.0,
-                    min_quote_amt=1.0,
-                    min_order_size=API_MIN_ORDER_SIZE,
-                    best_bid_fn=_latest_best_bid,
-                    stop_check=stop_event.is_set,
-                    external_fill_probe=_buy_fill_delta_probe,
-                    progress_probe=_buy_progress_probe,
-                    progress_probe_interval=60.0,
-                )
-            except Exception as exc:
-                print(f"[ERR] 买入下单异常：{exc}")
-                strategy.on_reject(str(exc))
-                buy_cooldown_until = time.time() + short_buy_cooldown
-                continue
-            print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
-            buy_status = str(buy_resp.get("status") or "").upper()
-            filled_amt = float(buy_resp.get("filled") or 0.0)
-            avg_price = buy_resp.get("avg_price")
-            if filled_amt > 0:
-                fallback_price = float(avg_price if avg_price is not None else ref_price)
-                prior_position = float(position_size or 0.0)
-                actual_avg_price: Optional[float] = None
-                actual_total_position: Optional[float] = None
-                origin_note = ""
-                if POST_BUY_POSITION_CHECK_DELAY > 0:
+                        if owned > 0:
+                            print(
+                                f"[HINT][BUY] 当前仓位{origin_hint} {owned:.4f}，但按手动份数 {order_size:.4f} 下单。"
+                            )
+                        else:
+                            print(f"[HINT][BUY] 手动份数 -> 本次下单 {order_size:.4f}")
+                else:
+                    order_size = _calc_size_by_1dollar(ref_price)
+                    print(f"[HINT] 未指定份数，按 $1 反推 -> size={order_size}")
+    
+                def _buy_progress_probe() -> None:
+                    try:
+                        avg_px, total_pos, origin_note = _lookup_position_avg_price(client, token_id)
+                    except Exception as probe_exc:
+                        print(f"[WATCHDOG][BUY] 持仓查询异常：{probe_exc}")
+                        return
+                    origin_display = origin_note or "positions"
+                    if total_pos is None or total_pos <= 0:
+                        print(f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} 当前无持仓")
+                        return
+                    avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
                     print(
-                        f"[INFO] 买入成交，延迟 {POST_BUY_POSITION_CHECK_DELAY:.0f}s 再查询持仓均价，等待 data-api 刷新…"
+                        f"[WATCHDOG][BUY] 持仓检查 -> origin={origin_display} avg={avg_display} size={total_pos:.4f}"
                     )
-                    time.sleep(POST_BUY_POSITION_CHECK_DELAY)
+    
+                baseline_position = float(position_size or 0.0)
+    
+                def _buy_fill_delta_probe() -> Optional[float]:
+                    try:
+                        _, latest_pos, _ = _lookup_position_avg_price(client, token_id)
+                    except Exception as probe_exc:
+                        print(f"[WATCHDOG][BUY] 持仓校对异常：{probe_exc}")
+                        return None
+                    if latest_pos is None:
+                        return None
+                    return max(float(latest_pos) - baseline_position, 0.0)
+    
+                if awaiting_buy_passthrough:
+                    awaiting_buy_passthrough = False
                 try:
-                    actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
-                        client, token_id
+                    buy_resp = maker_buy_follow_bid(
+                        client=client,
+                        token_id=token_id,
+                        target_size=order_size,
+                        poll_sec=10.0,
+                        min_quote_amt=1.0,
+                        min_order_size=API_MIN_ORDER_SIZE,
+                        best_bid_fn=_latest_best_bid,
+                        stop_check=stop_event.is_set,
+                        external_fill_probe=_buy_fill_delta_probe,
+                        progress_probe=_buy_progress_probe,
+                        progress_probe_interval=60.0,
                     )
                 except Exception as exc:
+                    print(f"[ERR] 买入下单异常：{exc}")
+                    strategy.on_reject(str(exc))
+                    buy_cooldown_until = time.time() + short_buy_cooldown
+                    continue
+                print(f"[TRADE][BUY][MAKER] resp={buy_resp}")
+                buy_status = str(buy_resp.get("status") or "").upper()
+                filled_amt = float(buy_resp.get("filled") or 0.0)
+                avg_price = buy_resp.get("avg_price")
+                if filled_amt > 0:
+                    fallback_price = float(avg_price if avg_price is not None else ref_price)
+                    prior_position = float(position_size or 0.0)
+                    actual_avg_price: Optional[float] = None
+                    actual_total_position: Optional[float] = None
+                    origin_note = ""
+                    if POST_BUY_POSITION_CHECK_DELAY > 0:
+                        print(
+                            f"[INFO] 买入成交，延迟 {POST_BUY_POSITION_CHECK_DELAY:.0f}s 再查询持仓均价，等待 data-api 刷新…"
+                        )
+                        time.sleep(POST_BUY_POSITION_CHECK_DELAY)
+                    try:
+                        actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
+                            client, token_id
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
+                        )
+                    fill_px = fallback_price
+                    if actual_avg_price is not None:
+                        fill_px = actual_avg_price
+                    elif origin_note:
+                        print(
+                            f"[WARN] 持仓均价查询失败({origin_note})，沿用下单均价 {fill_px:.4f}。"
+                        )
+                    if actual_total_position is not None and actual_total_position > 0:
+                        position_size = actual_total_position
+                    else:
+                        position_size = prior_position + filled_amt
+                    last_order_size = filled_amt
+                    if actual_avg_price is not None:
+                        display_size = (
+                            actual_total_position
+                            if actual_total_position is not None
+                            else position_size
+                        )
+                        origin_display = origin_note or "positions"
+                        print(
+                            f"[STATE] 持仓均价确认 -> origin={origin_display} avg={fill_px:.4f} size={display_size:.4f}"
+                        )
+                    buy_filled_kwargs = {
+                        "avg_price": fill_px,
+                        "size": filled_amt,
+                    }
+                    if strategy_supports_total_position:
+                        buy_filled_kwargs["total_position"] = position_size
+                    strategy.on_buy_filled(**buy_filled_kwargs)
                     print(
-                        f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
+                        f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
                     )
-                fill_px = fallback_price
-                if actual_avg_price is not None:
-                    fill_px = actual_avg_price
-                elif origin_note:
-                    print(
-                        f"[WARN] 持仓均价查询失败({origin_note})，沿用下单均价 {fill_px:.4f}。"
-                    )
-                if actual_total_position is not None and actual_total_position > 0:
-                    position_size = actual_total_position
                 else:
-                    position_size = prior_position + filled_amt
-                last_order_size = filled_amt
-                if actual_avg_price is not None:
-                    display_size = (
-                        actual_total_position
-                        if actual_total_position is not None
-                        else position_size
-                    )
-                    origin_display = origin_note or "positions"
-                    print(
-                        f"[STATE] 持仓均价确认 -> origin={origin_display} avg={fill_px:.4f} size={display_size:.4f}"
-                    )
-                buy_filled_kwargs = {
-                    "avg_price": fill_px,
-                    "size": filled_amt,
-                }
-                if strategy_supports_total_position:
-                    buy_filled_kwargs["total_position"] = position_size
-                strategy.on_buy_filled(**buy_filled_kwargs)
-                print(
-                    f"[STATE] 买入成交 -> status={buy_status or 'N/A'} price={fill_px:.4f} size={position_size:.4f}"
-                )
-            else:
-                reason_text = str(buy_resp)
-                print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
-                strategy.on_reject(reason_text)
-            buy_cooldown_until = time.time() + short_buy_cooldown
+                    reason_text = str(buy_resp)
+                    print(f"[WARN] 买入未成交(status={buy_status or 'N/A'})：{reason_text}")
+                    strategy.on_reject(reason_text)
+                buy_cooldown_until = time.time() + short_buy_cooldown
+    
+                if filled_amt <= 0:
+                    continue
+    
+                _execute_sell(position_size, floor_hint=strategy.sell_trigger_price(), source="[POST-BUY]")
 
-            if filled_amt <= 0:
-                continue
-
-            _execute_sell(position_size, floor_hint=strategy.sell_trigger_price(), source="[POST-BUY]")
+            finally:
+                next_loop_after = loop_started + min_loop_interval
 
     except KeyboardInterrupt:
         print("[CMD] 捕获到 Ctrl+C，准备退出…")
