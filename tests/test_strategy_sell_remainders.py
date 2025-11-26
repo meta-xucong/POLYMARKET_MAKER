@@ -27,3 +27,15 @@ def test_on_sell_filled_marks_remaining_sell_pending():
     assert status["state"] == "LONG"
     assert status["awaiting"] == ActionType.SELL
     assert status["position_size"] == pytest.approx(6.0)
+
+
+def test_mark_awaiting_allows_external_sell_flag():
+    cfg = StrategyConfig(token_id="T")
+    strategy = VolArbStrategy(cfg)
+
+    strategy.on_buy_filled(avg_price=0.5, size=10.0)
+    strategy.mark_awaiting(ActionType.SELL)
+
+    status = strategy.status()
+    assert status["state"] == "LONG"
+    assert status["awaiting"] == ActionType.SELL
