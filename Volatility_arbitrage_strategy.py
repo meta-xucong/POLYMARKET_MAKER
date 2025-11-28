@@ -454,6 +454,51 @@ class VolArbStrategy:
         self._awaiting = None
         self._last_reject_reason = reason
 
+    def sync_position(
+        self, total_position: Optional[float], *, ref_price: Optional[float] = None
+    ) -> None:
+        """显式以链上仓位为准同步本地状态。
+
+        * total_position > dust_floor 时：视为持仓，切换为 SELL 阻塞，避免重复买入。
+        * total_position <= dust_floor 时：视为清仓，解除等待并允许重新买入。
+        """
+
+        eps = 1e-4
+
+        numeric_pos: Optional[float] = None
+        if total_position is not None:
+            try:
+                numeric_pos = max(float(total_position), 0.0)
+            except (TypeError, ValueError):
+                numeric_pos = None
+
+        dust_floor = eps
+        if self._min_market_order_size is not None:
+            dust_floor = max(self._min_market_order_size, dust_floor)
+
+        if numeric_pos is None or numeric_pos <= dust_floor:
+            # 链上视为已清仓：放行后续买入
+            self._state = "FLAT"
+            self._position_size = None
+            self._awaiting = None
+            self._entry_price = None
+            self._last_reject_reason = None
+            self._maybe_increment_drop_pct()
+            return
+
+        # 链上存在可交易持仓：保持 SELL 阻塞，防止重复买入
+        self._position_size = numeric_pos
+        self._state = "LONG"
+        self._awaiting = ActionType.SELL
+        if ref_price is not None:
+            self._entry_price = ref_price
+        elif self._entry_price is None:
+            if self._last_buy_price is not None:
+                self._entry_price = self._last_buy_price
+            elif self._last_best_bid is not None:
+                self._entry_price = self._last_best_bid
+        self._last_reject_reason = None
+
     def mark_awaiting(self, action: Optional[ActionType]) -> None:
         """显式设置等待状态（用于外部状态同步时标记 SELL 等流程）。"""
 
