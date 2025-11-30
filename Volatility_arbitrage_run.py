@@ -2423,6 +2423,11 @@ def main():
             size=sell_filled if sell_filled > 0 else None,
             remaining=remaining_for_strategy,
         )
+        if remaining_for_strategy is None:
+            strategy.mark_awaiting(None)
+            print(
+                "[STATE] 卖出流程已完成或剩余低于最小下单量，切换为等待买入/空闲状态。"
+            )
         if sell_remaining > eps and not treat_as_dust:
             position_size = sell_remaining
             last_order_size = sell_remaining
