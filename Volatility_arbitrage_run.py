@@ -514,6 +514,90 @@ def _prompt_common_deadline_override(
     )
     return utc_dt.timestamp(), False
 
+def _count_decimal_places(value: Any) -> Optional[int]:
+    try:
+        dec = Decimal(str(value))
+    except Exception:
+        return None
+    dec = dec.normalize()
+    exponent = dec.as_tuple().exponent
+    if exponent >= 0:
+        return 0
+    return abs(int(exponent))
+
+
+def _infer_market_price_precision_from_raw(raw: Any) -> Optional[int]:
+    if not isinstance(raw, dict):
+        return None
+
+    def _normalize_candidate(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            if isinstance(val, (int, float)) and val > 0 and val < 1:
+                dp = _count_decimal_places(val)
+                return dp
+            cand_int = int(val)
+            if cand_int >= 0:
+                return cand_int
+        except Exception:
+            return None
+        return None
+
+    primary_keys = (
+        "price_precision",
+        "pricePrecision",
+        "priceDecimals",
+        "displayPriceDecimalPrecision",
+        "displayPriceDecimals",
+        "priceDecimal",
+        "priceDecimalPlaces",
+    )
+    for key in primary_keys:
+        candidate = _normalize_candidate(raw.get(key))
+        if candidate:
+            return candidate
+
+    tick_keys = (
+        "priceTick",
+        "tickSize",
+        "tick",
+        "priceIncrement",
+        "minimumPriceIncrement",
+    )
+    for key in tick_keys:
+        candidate = _normalize_candidate(raw.get(key))
+        if candidate:
+            return candidate
+
+    nested_lists = ("outcomes", "tokens", "clobTokens", "clobTokenIds")
+    for k in nested_lists:
+        seq = raw.get(k)
+        if not isinstance(seq, list):
+            continue
+        for item in seq:
+            if not isinstance(item, dict):
+                continue
+            nested_candidate = _infer_market_price_precision_from_raw(item)
+            if nested_candidate:
+                return nested_candidate
+    return None
+
+
+def _infer_market_price_precision(meta: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(meta, dict):
+        return None
+    if "price_precision" in meta:
+        try:
+            cand = int(meta["price_precision"])
+            if cand >= 0:
+                return cand
+        except Exception:
+            pass
+    raw_meta = meta.get("raw") if isinstance(meta, dict) else None
+    return _infer_market_price_precision_from_raw(raw_meta)
+
+
 def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> Dict[str, Any]:
     meta: Dict[str, Any] = {}
     if not isinstance(m, dict):
@@ -565,6 +649,10 @@ def _market_meta_from_obj(m: dict, timezone_override: Optional[Any] = None) -> D
 
     if "end_ts" not in meta and "resolved_ts" in meta:
         meta["end_ts"] = meta["resolved_ts"]
+
+    precision = _infer_market_price_precision_from_raw(m)
+    if precision is not None:
+        meta["price_precision"] = precision
 
     meta["raw"] = m
     return meta
@@ -1598,6 +1686,39 @@ def main():
         print("[ERR] 未能获取市场结束时间，程序终止。")
         return
 
+    def _calc_profit_floor(meta: Dict[str, Any]) -> Tuple[float, Optional[int]]:
+        precision = _infer_market_price_precision(meta)
+        floor = 0.003
+        if precision == 2:
+            floor = 0.01
+        elif precision == 3:
+            floor = 0.003
+        return floor, precision
+
+    profit_floor, market_price_precision = _calc_profit_floor(market_meta)
+
+    def _log_profit_floor(prefix: str = "[INFO]") -> None:
+        if market_price_precision is not None:
+            print(
+                f"{prefix} 检测到市场价格精度为 {market_price_precision} 位小数，"
+                f"盈利百分比下限为 {profit_floor * 100:.3f}%。"
+            )
+        else:
+            print(
+                f"{prefix} 未能识别市场价格精度，默认按盈利百分比下限 {profit_floor * 100:.3f}% 执行。"
+            )
+
+    def _enforce_profit_floor(current: float, *, prefix: str = "[WARN]") -> float:
+        if current < profit_floor:
+            print(
+                f"{prefix} 盈利百分比不能低于 {profit_floor * 100:.3f}%，"
+                f"已自动调整为 {profit_floor * 100:.3f}%。"
+            )
+            return profit_floor
+        return current
+
+    _log_profit_floor()
+
     def _prompt_yes_or_no(message: str, default_yes: bool = True) -> Optional[bool]:
         print(message)
         raw = input().strip()
@@ -1686,6 +1807,7 @@ def main():
     except Exception:
         print("[ERR] 盈利百分比非法，退出。")
         return
+    profit_pct = _enforce_profit_floor(profit_pct)
 
     print(
         "是否在每次卖出后抬升下一轮买入的跌幅阈值？"
@@ -1791,6 +1913,7 @@ def main():
 
     def _refresh_market_meta() -> Dict[str, Any]:
         nonlocal market_meta, market_deadline_ts, unable_to_refresh_logged
+        nonlocal profit_floor, market_price_precision, profit_pct
         slug = slug_for_refresh
         if not slug:
             if not unable_to_refresh_logged:
@@ -1815,7 +1938,23 @@ def main():
                     new_deadline = _calc_deadline(refreshed)
                     if new_deadline:
                         market_deadline_ts = new_deadline
+                new_floor, new_precision = _calc_profit_floor(refreshed)
+                meta_changed = (
+                    new_precision != market_price_precision
+                    or abs(new_floor - profit_floor) > 1e-12
+                )
                 market_meta = refreshed
+                profit_floor = new_floor
+                market_price_precision = new_precision
+                if meta_changed:
+                    _log_profit_floor("[INFO][REFRESH]")
+                    adjusted_profit = _enforce_profit_floor(
+                        profit_pct, prefix="[ADJUST]"
+                    )
+                    if adjusted_profit != profit_pct:
+                        profit_pct = adjusted_profit
+                        cfg.profit_pct = cfg.profit_ratio = profit_pct
+                        strategy.cfg.profit_pct = strategy.cfg.profit_ratio = profit_pct
         return market_meta
 
     def _calc_size_by_1dollar(ask_px: float) -> float:
