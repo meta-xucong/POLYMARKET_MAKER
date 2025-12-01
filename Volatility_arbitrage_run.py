@@ -1686,6 +1686,9 @@ def main():
     except Exception:
         print("[ERR] 盈利百分比非法，退出。")
         return
+    if profit_pct < 0.003:
+        print("[WARN] 盈利百分比不能低于 0.3%，已自动调整为 0.3%。")
+        profit_pct = 0.003
 
     print(
         "是否在每次卖出后抬升下一轮买入的跌幅阈值？"
