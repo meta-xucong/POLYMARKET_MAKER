@@ -824,6 +824,17 @@ class ClobPolymarketAPI(PolymarketAPI):
 
         status_upper = str(status_value).upper()
 
+        average_price: Optional[float] = None
+
+        for key in price_keys:
+            candidate = coerce_float(payload.get(key))
+            if candidate is not None:
+                average_price = candidate
+                break
+
+        if average_price is None and total_from_fills > 0 and total_notional > 0:
+            average_price = total_notional / total_from_fills
+
         if (filled_amount is None or filled_amount <= 1e-12) and average_price is not None:
             if filled_amount_quote is not None and filled_amount_quote > 0:
                 filled_amount = filled_amount_quote / max(average_price, 1e-12)
@@ -855,16 +866,6 @@ class ClobPolymarketAPI(PolymarketAPI):
             raise RuntimeError(
                 f"Unable to coerce filled amount to float from payload: {payload!r}"
             )
-
-        average_price: Optional[float] = None
-        for key in price_keys:
-            candidate = coerce_float(payload.get(key))
-            if candidate is not None:
-                average_price = candidate
-                break
-
-        if average_price is None and total_from_fills > 0 and total_notional > 0:
-            average_price = total_notional / total_from_fills
 
         result: Dict[str, object] = {
             "status": str(status_value),
