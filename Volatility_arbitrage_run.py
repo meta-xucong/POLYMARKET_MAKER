@@ -21,6 +21,7 @@ import json
 import inspect
 from queue import Queue, Empty
 from typing import Dict, Any, Tuple, List, Optional
+import math
 from decimal import Decimal, ROUND_UP, ROUND_DOWN
 import requests
 from datetime import datetime, timezone, timedelta, date, time as dtime
@@ -75,7 +76,9 @@ DATA_API_ROOT = os.getenv("POLY_DATA_API_ROOT", "https://data-api.polymarket.com
 API_MIN_ORDER_SIZE = 5.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
-POST_BUY_POSITION_CHECK_DELAY = 5.0
+POST_BUY_POSITION_CHECK_DELAY = 60.0
+POST_BUY_POSITION_CHECK_ATTEMPTS = 3
+POST_BUY_POSITION_CHECK_INTERVAL = 7.0
 
 
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
@@ -2974,6 +2977,7 @@ def main():
                 if filled_amt > 0:
                     fallback_price = float(avg_price if avg_price is not None else ref_price)
                     prior_position = float(position_size or 0.0)
+                    expected_total_position = prior_position + filled_amt
                     actual_avg_price: Optional[float] = None
                     actual_total_position: Optional[float] = None
                     origin_note = ""
@@ -2982,14 +2986,66 @@ def main():
                             f"[INFO] 买入成交，延迟 {POST_BUY_POSITION_CHECK_DELAY:.0f}s 再查询持仓均价，等待 data-api 刷新…"
                         )
                         time.sleep(POST_BUY_POSITION_CHECK_DELAY)
-                    try:
-                        actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
-                            client, token_id
-                        )
-                    except Exception as exc:
-                        print(
-                            f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
-                        )
+                    print(
+                        f"[INFO] 开始持仓均价多轮确认（目标 size≈{expected_total_position:.4f}，"
+                        f"最多 {POST_BUY_POSITION_CHECK_ATTEMPTS} 轮，每轮间隔 {POST_BUY_POSITION_CHECK_INTERVAL:.0f}s）"
+                    )
+
+                    consecutive_hits = 0
+                    last_avg: Optional[float] = None
+                    last_total: Optional[float] = None
+                    for attempt in range(POST_BUY_POSITION_CHECK_ATTEMPTS):
+                        try:
+                            actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
+                                client, token_id
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
+                            )
+                            actual_avg_price = None
+                            actual_total_position = None
+                            break
+
+                        if (
+                            actual_avg_price is not None
+                            and actual_total_position is not None
+                        ):
+                            if (
+                                last_avg is not None
+                                and last_total is not None
+                                and math.isclose(actual_avg_price, last_avg, rel_tol=1e-6, abs_tol=1e-8)
+                                and math.isclose(actual_total_position, last_total, rel_tol=1e-6, abs_tol=1e-8)
+                            ):
+                                consecutive_hits += 1
+                            else:
+                                consecutive_hits = 1
+                                last_avg = actual_avg_price
+                                last_total = actual_total_position
+
+                            expected_total_ok = actual_total_position >= expected_total_position - 1e-6
+                            if consecutive_hits >= 2 and expected_total_ok:
+                                break
+                        else:
+                            consecutive_hits = 0
+                            last_avg = None
+                            last_total = None
+
+                        if attempt < POST_BUY_POSITION_CHECK_ATTEMPTS - 1:
+                            time.sleep(POST_BUY_POSITION_CHECK_INTERVAL)
+
+                    if consecutive_hits < 2 or actual_total_position is None or actual_avg_price is None:
+                        actual_avg_price = None
+                        actual_total_position = None
+                        if origin_note:
+                            print(
+                                f"[WARN] 持仓均价多轮确认未达标({origin_note})，沿用下单均价 {fallback_price:.4f}。"
+                            )
+                        else:
+                            print(
+                                f"[WARN] 持仓均价多轮确认未达标，沿用下单均价 {fallback_price:.4f}。"
+                            )
+
                     fill_px = fallback_price
                     if actual_avg_price is not None:
                         fill_px = actual_avg_price
@@ -3000,7 +3056,7 @@ def main():
                     if actual_total_position is not None and actual_total_position > 0:
                         position_size = actual_total_position
                     else:
-                        position_size = prior_position + filled_amt
+                        position_size = expected_total_position
                     last_order_size = filled_amt
                     if actual_avg_price is not None:
                         display_size = (
