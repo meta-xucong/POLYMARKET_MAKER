@@ -881,6 +881,12 @@ def maker_sell_follow_ask_with_floor_wait(
     filled_total = 0.0
     notional_sum = 0.0
 
+    goal_cap = goal_size
+
+    def _apply_goal_cap(candidate: float) -> float:
+        capped = min(candidate, goal_cap)
+        return max(capped, filled_total)
+
     active_order: Optional[str] = None
     active_price: Optional[float] = None
 
@@ -976,7 +982,7 @@ def maker_sell_follow_ask_with_floor_wait(
                         live_target + reserved if reserved > _MIN_FILL_EPS else live_target
                     )
                     min_goal = max(filled_total, 0.0)
-                    new_goal = max(adjusted_target, min_goal)
+                    new_goal = _apply_goal_cap(max(adjusted_target, min_goal))
                     if abs(new_goal - goal_size) > _MIN_FILL_EPS:
                         change = "扩充" if new_goal > goal_size else "收缩"
                         prev_goal = goal_size
@@ -1157,8 +1163,8 @@ def maker_sell_follow_ask_with_floor_wait(
                                     if reserved > _MIN_FILL_EPS
                                     else live_target
                                 )
-                                refreshed_goal = max(
-                                    filled_total + adjusted_live_target, filled_total
+                                refreshed_goal = _apply_goal_cap(
+                                    max(filled_total + adjusted_live_target, filled_total)
                                 )
                                 forced_remaining = max(refreshed_goal - filled_total, 0.0)
                                 if forced_remaining >= 0.01 and (
@@ -1206,8 +1212,8 @@ def maker_sell_follow_ask_with_floor_wait(
                                     if reserved > _MIN_FILL_EPS
                                     else refreshed_size
                                 )
-                                refreshed_goal = max(
-                                    filled_total + adjusted_refreshed, filled_total
+                                refreshed_goal = _apply_goal_cap(
+                                    max(filled_total + adjusted_refreshed, filled_total)
                                 )
                             except (TypeError, ValueError):
                                 refreshed_goal = None
