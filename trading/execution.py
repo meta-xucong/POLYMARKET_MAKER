@@ -745,11 +745,16 @@ class ClobPolymarketAPI(PolymarketAPI):
         )
 
         filled_amount: Optional[float] = None
+        filled_amount_quote: Optional[float] = None
         for key in primary_filled_keys:
             candidate = coerce_float(payload.get(key))
-            if candidate is not None:
-                filled_amount = candidate
-                break
+            if candidate is None:
+                continue
+            if key == "filledAmountQuote" and filled_amount_quote is None:
+                filled_amount_quote = candidate
+                continue
+            filled_amount = candidate
+            break
 
         price_keys = (
             "avgPrice",
@@ -818,6 +823,10 @@ class ClobPolymarketAPI(PolymarketAPI):
                 filled_amount = 0.0
 
         status_upper = str(status_value).upper()
+
+        if (filled_amount is None or filled_amount <= 1e-12) and average_price is not None:
+            if filled_amount_quote is not None and filled_amount_quote > 0:
+                filled_amount = filled_amount_quote / max(average_price, 1e-12)
 
         if (filled_amount is None or filled_amount <= 1e-12) and status_upper in {
             "FILLED",
