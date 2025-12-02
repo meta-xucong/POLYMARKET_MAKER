@@ -971,10 +971,7 @@ def maker_sell_follow_ask_with_floor_wait(
                 except (TypeError, ValueError):
                     live_target = None
                 if live_target is not None:
-                    reserved = _active_reserved_size()
-                    adjusted_target = (
-                        live_target + reserved if reserved > _MIN_FILL_EPS else live_target
-                    )
+                    adjusted_target = live_target
                     min_goal = max(filled_total, 0.0)
                     new_goal = max(adjusted_target, min_goal)
                     if abs(new_goal - goal_size) > _MIN_FILL_EPS:
