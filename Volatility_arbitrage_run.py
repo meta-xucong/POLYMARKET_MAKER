@@ -2492,9 +2492,12 @@ def main():
             strategy.on_reject("invalid sell size")
             return
 
-        floor_price = floor_hint
+        floor_price = strategy.sell_trigger_price()
         if floor_price is None:
-            floor_price = strategy.sell_trigger_price()
+            floor_price = floor_hint
+        elif floor_hint is not None:
+            # 地板价不得低于“买入均价 + 盈利阈值”，若上游给出更高提示价则取较高值。
+            floor_price = max(floor_price, floor_hint)
 
         if floor_price is None:
             print(f"[WARN] {source} 无法计算卖出地板价，跳过卖出流程。")
