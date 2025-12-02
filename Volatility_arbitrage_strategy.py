@@ -269,6 +269,11 @@ class VolArbStrategy:
         else:
             self._reset_drop_metrics()
 
+    def _reset_price_history(self) -> None:
+        """清空价格历史及衍生的跌幅统计，用于卖出后重新起算。"""
+        self._price_history.clear()
+        self._reset_drop_metrics()
+
     def _reset_drop_metrics(self) -> None:
         self._window_high_price = None
         self._window_low_price = None
@@ -429,6 +434,7 @@ class VolArbStrategy:
             self._entry_price = None
             self._position_size = None
             self._awaiting = None
+            self._reset_price_history()
         else:
             self._position_size = remaining_size
             self._state = "LONG"
@@ -483,6 +489,7 @@ class VolArbStrategy:
             self._awaiting = None
             self._entry_price = None
             self._last_reject_reason = None
+            self._reset_price_history()
             self._maybe_increment_drop_pct()
             return
 
