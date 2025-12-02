@@ -323,12 +323,84 @@ def _update_fill_totals(
     status_text: Optional[str] = None,
     expected_full_size: Optional[float] = None,
 ) -> Tuple[float, float, float]:
-    filled_amount = float(status_payload.get("filledAmount", 0.0) or 0.0)
-    avg_price = status_payload.get("avgPrice")
+    avg_price = _coerce_float(status_payload.get("avgPrice"))
+
+    price_keys = (
+        "avgPrice",
+        "averagePrice",
+        "avg_price",
+        "filledAvgPrice",
+        "filledAveragePrice",
+        "executionPrice",
+        "averageExecutionPrice",
+        "fillPrice",
+        "matchedPrice",
+        "price",
+        "lastPrice",
+        "lastTradePrice",
+        "markPrice",
+    )
+
+    size_keys = (
+        "size",
+        "quantity",
+        "qty",
+        "amount",
+        "filledAmount",
+        "filled",
+        "filledQuantity",
+        "filledSize",
+        "matchedShares",
+        "shares",
+        "baseAmount",
+        "takingAmount",
+        "takerAmount",
+        "taker_amount",
+    )
+
+    fills_payload = status_payload.get("fills")
+    fills_sequence = fills_payload if isinstance(fills_payload, (list, tuple)) else None
+
+    total_from_fills = 0.0
+    total_notional = 0.0
+
+    if fills_sequence is not None:
+        for entry in fills_sequence:
+            if not isinstance(entry, dict):
+                continue
+            size_val: Optional[float] = None
+            for key in size_keys:
+                size_val = _coerce_float(entry.get(key))
+                if size_val is not None and size_val > 0:
+                    break
+            if size_val is None or size_val <= 0:
+                continue
+            total_from_fills += size_val
+
+            price_val: Optional[float] = None
+            for key in price_keys:
+                price_val = _coerce_float(entry.get(key))
+                if price_val is not None:
+                    break
+            if price_val is not None:
+                total_notional += price_val * size_val
+
+    filled_amount = _coerce_float(status_payload.get("filledAmount")) or 0.0
+    filled_amount_quote = _coerce_float(status_payload.get("filledAmountQuote"))
+
+    if filled_amount <= _MIN_FILL_EPS and total_from_fills > 0:
+        filled_amount = total_from_fills
+
+    if avg_price is None and total_from_fills > 0 and total_notional > 0:
+        avg_price = total_notional / total_from_fills
+
+    if filled_amount <= _MIN_FILL_EPS and filled_amount_quote is not None:
+        price_hint = avg_price if avg_price is not None else last_known_price
+        if price_hint and price_hint > 0:
+            filled_amount = max(filled_amount, filled_amount_quote / max(price_hint, 1e-12))
+
     if avg_price is None:
         avg_price = last_known_price
-    else:
-        avg_price = float(avg_price)
 
     if filled_amount <= _MIN_FILL_EPS and status_text:
         status_upper = status_text.upper()
@@ -856,6 +928,19 @@ def maker_sell_follow_ask_with_floor_wait(
     next_position_refresh = 0.0
     next_ask_validation = 0.0
 
+    def _active_reserved_size() -> float:
+        if not active_order:
+            return 0.0
+        rec = records.get(active_order)
+        if rec is None:
+            return 0.0
+        try:
+            total_size = float(rec.get("size", 0.0) or 0.0)
+        except Exception:
+            total_size = 0.0
+        filled_so_far = accounted.get(active_order, 0.0)
+        return max(total_size - filled_so_far, 0.0)
+
     while True:
         if stop_check and stop_check():
             if active_order:
@@ -886,8 +971,12 @@ def maker_sell_follow_ask_with_floor_wait(
                 except (TypeError, ValueError):
                     live_target = None
                 if live_target is not None:
+                    reserved = _active_reserved_size()
+                    adjusted_target = (
+                        live_target + reserved if reserved > _MIN_FILL_EPS else live_target
+                    )
                     min_goal = max(filled_total, 0.0)
-                    new_goal = max(live_target, min_goal)
+                    new_goal = max(adjusted_target, min_goal)
                     if abs(new_goal - goal_size) > _MIN_FILL_EPS:
                         change = "扩充" if new_goal > goal_size else "收缩"
                         prev_goal = goal_size
@@ -1062,7 +1151,15 @@ def maker_sell_follow_ask_with_floor_wait(
                             except (TypeError, ValueError):
                                 live_target = None
                             if live_target is not None:
-                                refreshed_goal = max(filled_total + live_target, filled_total)
+                                reserved = _active_reserved_size()
+                                adjusted_live_target = (
+                                    live_target + reserved
+                                    if reserved > _MIN_FILL_EPS
+                                    else live_target
+                                )
+                                refreshed_goal = max(
+                                    filled_total + adjusted_live_target, filled_total
+                                )
                                 forced_remaining = max(refreshed_goal - filled_total, 0.0)
                                 if forced_remaining >= 0.01 and (
                                     not api_min_qty or forced_remaining + _MIN_FILL_EPS >= api_min_qty
@@ -1103,7 +1200,15 @@ def maker_sell_follow_ask_with_floor_wait(
                                 refreshed_size = max(
                                     _floor_to_dp(float(refreshed_position), SELL_SIZE_DP), 0.0
                                 )
-                                refreshed_goal = max(filled_total + refreshed_size, filled_total)
+                                reserved = _active_reserved_size()
+                                adjusted_refreshed = (
+                                    refreshed_size + reserved
+                                    if reserved > _MIN_FILL_EPS
+                                    else refreshed_size
+                                )
+                                refreshed_goal = max(
+                                    filled_total + adjusted_refreshed, filled_total
+                                )
                             except (TypeError, ValueError):
                                 refreshed_goal = None
 
