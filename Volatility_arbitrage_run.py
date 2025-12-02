@@ -2567,6 +2567,23 @@ def main():
             print(
                 "[STATE] 卖出流程已完成或剩余低于最小下单量，切换为等待买入/空闲状态。"
             )
+            wait_after_sell_sec = 300.0
+            heartbeat_interval = 60.0
+            pause_deadline = time.time() + wait_after_sell_sec
+            heartbeat_tick = 1
+            while True:
+                remaining_wait = pause_deadline - time.time()
+                if remaining_wait <= 0:
+                    break
+                sleep_window = min(heartbeat_interval, remaining_wait)
+                if stop_event.wait(sleep_window):
+                    break
+                print(
+                    "[STATE] 卖出完成，等待远端仓位同步中… "
+                    f"心跳 {heartbeat_tick}/{int(wait_after_sell_sec // heartbeat_interval)}"
+                )
+                heartbeat_tick += 1
+            next_loop_after = max(next_loop_after, pause_deadline)
         if sell_remaining > eps and not treat_as_dust:
             position_size = sell_remaining
             last_order_size = sell_remaining
