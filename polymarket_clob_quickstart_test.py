@@ -18,10 +18,15 @@
 import os
 import sys
 
-from py_clob_client.client import ClobClient
-from py_clob_client.constants import POLYGON
-from py_clob_client.clob_types import OpenOrderParams
-from py_clob_client.exceptions import PolyApiException
+try:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.constants import POLYGON
+    from py_clob_client.clob_types import OpenOrderParams
+    from py_clob_client.exceptions import PolyApiException
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    import pytest
+
+    pytest.skip("py_clob_client 未安装，跳过快速体验脚本。", allow_module_level=True)
 
 
 def main() -> None:

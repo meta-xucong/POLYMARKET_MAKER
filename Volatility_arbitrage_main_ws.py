@@ -15,6 +15,8 @@ from __future__ import annotations
 import json, time, threading, ssl
 from typing import Callable, List, Optional, Any, Dict
 
+from network_guard import interaction_guard
+
 try:
     import websocket  # websocket-client
 except Exception:
@@ -62,19 +64,23 @@ def ws_watch_by_ids(asset_ids: List[str],
     while not stop_event.is_set():
         ping_stop = {"v": False}
 
+        def _throttled_send(payload: str, channel_label: str) -> None:
+            interaction_guard.wait_turn(channel_label)
+            ws.send(payload)
+
         def on_open(ws):
             nonlocal reconnect_delay
             if verbose:
                 print(f"[{_now()}][WS][OPEN] -> {WS_BASE+'/ws/'+CHANNEL}")
             payload = {"type": CHANNEL, "assets_ids": ids}
-            ws.send(json.dumps(payload))
+            _throttled_send(json.dumps(payload), "ws:subscribe")
             reconnect_delay = 1
 
             # 文本心跳 PING（与底层 ping 帧并行存在）
             def _ping():
                 while not ping_stop["v"] and not stop_event.is_set():
                     try:
-                        ws.send("PING")
+                        _throttled_send("PING", "ws:ping")
                         time.sleep(10)
                     except Exception:
                         break
@@ -115,6 +121,8 @@ def ws_watch_by_ids(asset_ids: List[str],
             ping_stop["v"] = True
             if verbose:
                 print(f"[{_now()}][WS][CLOSED] {status_code} {msg}")
+            if verbose:
+                interaction_guard.log_snapshot(prefix="[WS][METRICS]")
 
         wsa = websocket.WebSocketApp(
             WS_BASE + "/ws/" + CHANNEL,
