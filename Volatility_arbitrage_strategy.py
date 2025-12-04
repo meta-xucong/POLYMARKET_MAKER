@@ -495,8 +495,6 @@ class VolArbStrategy:
         elif self._entry_price is None:
             if self._last_buy_price is not None:
                 self._entry_price = self._last_buy_price
-            elif self._last_best_bid is not None:
-                self._entry_price = self._last_best_bid
         self._last_reject_reason = None
 
     def mark_awaiting(self, action: Optional[ActionType]) -> None:

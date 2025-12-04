@@ -77,7 +77,7 @@ API_MIN_ORDER_SIZE = 5.0
 ORDERBOOK_STALE_AFTER_SEC = 5.0
 POSITION_SYNC_INTERVAL = 60.0
 POST_BUY_POSITION_CHECK_DELAY = 60.0
-POST_BUY_POSITION_CHECK_ATTEMPTS = 3
+POST_BUY_POSITION_CHECK_ATTEMPTS = 5
 POST_BUY_POSITION_CHECK_INTERVAL = 7.0
 
 
@@ -2315,6 +2315,15 @@ def main():
         position_size = new_size
         should_sync_state = changed
 
+        if new_size is not None and avg_px is None:
+            origin_display = origin_note or "positions"
+            print(
+                f"[FATAL][POSITION] {reason} -> origin={origin_display} 无法获取持仓均价，停止脚本以避免错误卖出。"
+            )
+            strategy.stop("missing avg price during position sync")
+            stop_event.set()
+            return
+
         if not should_sync_state:
             # 即便仓位未变动，也要校正策略状态：
             #  - 远端有仓位但策略仍为 FLAT；
@@ -2994,80 +3003,112 @@ def main():
                     consecutive_hits = 0
                     last_avg: Optional[float] = None
                     last_total: Optional[float] = None
-                    for attempt in range(POST_BUY_POSITION_CHECK_ATTEMPTS):
-                        try:
-                            actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
-                                client, token_id
-                            )
-                        except Exception as exc:
-                            print(
-                                f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
-                            )
-                            actual_avg_price = None
-                            actual_total_position = None
+                    confirmed_avg: Optional[float] = None
+                    confirmed_total: Optional[float] = None
+                    success_samples: List[Tuple[float, float]] = []
+                    round_index = 0
+
+                    while confirmed_avg is None or confirmed_total is None:
+                        round_index += 1
+                        round_success_start = len(success_samples)
+                        for attempt in range(POST_BUY_POSITION_CHECK_ATTEMPTS):
+                            try:
+                                actual_avg_price, actual_total_position, origin_note = _lookup_position_avg_price(
+                                    client, token_id
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"[WARN] 持仓均价查询异常：{exc}，沿用下单均价 {fallback_price:.4f}。"
+                                )
+                                actual_avg_price = None
+                                actual_total_position = None
+                                break
+
+                            if (
+                                actual_avg_price is not None
+                                and actual_total_position is not None
+                            ):
+                                success_samples.append((actual_avg_price, actual_total_position))
+                                if (
+                                    last_avg is not None
+                                    and last_total is not None
+                                    and math.isclose(actual_avg_price, last_avg, rel_tol=1e-6, abs_tol=1e-8)
+                                    and math.isclose(actual_total_position, last_total, rel_tol=1e-6, abs_tol=1e-8)
+                                ):
+                                    consecutive_hits += 1
+                                else:
+                                    consecutive_hits = 1
+                                    last_avg = actual_avg_price
+                                    last_total = actual_total_position
+
+                                expected_total_ok = actual_total_position >= expected_total_position - 1e-6
+                                if consecutive_hits >= 3 and expected_total_ok:
+                                    confirmed_avg = actual_avg_price
+                                    confirmed_total = actual_total_position
+                                    break
+                            else:
+                                consecutive_hits = 0
+                                last_avg = None
+                                last_total = None
+
+                            if attempt < POST_BUY_POSITION_CHECK_ATTEMPTS - 1:
+                                time.sleep(POST_BUY_POSITION_CHECK_INTERVAL)
+
+                        if confirmed_avg is not None and confirmed_total is not None:
                             break
 
-                        if (
-                            actual_avg_price is not None
-                            and actual_total_position is not None
-                        ):
-                            if (
-                                last_avg is not None
-                                and last_total is not None
-                                and math.isclose(actual_avg_price, last_avg, rel_tol=1e-6, abs_tol=1e-8)
-                                and math.isclose(actual_total_position, last_total, rel_tol=1e-6, abs_tol=1e-8)
-                            ):
-                                consecutive_hits += 1
-                            else:
-                                consecutive_hits = 1
-                                last_avg = actual_avg_price
-                                last_total = actual_total_position
+                        if len(success_samples) == round_success_start:
+                            origin_display = origin_note or "positions"
+                            print(
+                                "[FATAL] 持仓均价多轮确认未能获取任何有效结果，停止脚本以避免错误卖出。 "
+                                f"origin={origin_display}"
+                            )
+                            strategy.stop("missing avg price after buy")
+                            stop_event.set()
+                            break
 
-                            expected_total_ok = actual_total_position >= expected_total_position - 1e-6
-                            if consecutive_hits >= 2 and expected_total_ok:
+                        tolerance_kwargs = {"rel_tol": 1e-6, "abs_tol": 1e-8}
+                        for candidate_avg, candidate_total in success_samples:
+                            if candidate_total is None:
+                                continue
+                            if candidate_total < expected_total_position - 1e-6:
+                                continue
+
+                            match_count = 0
+                            for avg_val, total_val in success_samples:
+                                if (
+                                    math.isclose(candidate_avg, avg_val, **tolerance_kwargs)
+                                    and math.isclose(candidate_total, total_val, **tolerance_kwargs)
+                                ):
+                                    match_count += 1
+                            if match_count >= 3:
+                                confirmed_avg = candidate_avg
+                                confirmed_total = candidate_total
                                 break
-                        else:
+
+                        if confirmed_avg is None or confirmed_total is None:
+                            origin_display = origin_note or "positions"
+                            print(
+                                "[WARN] 持仓均价未满足三次一致确认，继续进入下一轮查询。 "
+                                f"已完成 {round_index * POST_BUY_POSITION_CHECK_ATTEMPTS} 次尝试，origin={origin_display}"
+                            )
                             consecutive_hits = 0
                             last_avg = None
                             last_total = None
 
-                        if attempt < POST_BUY_POSITION_CHECK_ATTEMPTS - 1:
-                            time.sleep(POST_BUY_POSITION_CHECK_INTERVAL)
+                    if stop_event.is_set():
+                        return
 
-                    if consecutive_hits < 2 or actual_total_position is None or actual_avg_price is None:
-                        actual_avg_price = None
-                        actual_total_position = None
-                        if origin_note:
-                            print(
-                                f"[WARN] 持仓均价多轮确认未达标({origin_note})，沿用下单均价 {fallback_price:.4f}。"
-                            )
-                        else:
-                            print(
-                                f"[WARN] 持仓均价多轮确认未达标，沿用下单均价 {fallback_price:.4f}。"
-                            )
-
-                    fill_px = fallback_price
-                    if actual_avg_price is not None:
-                        fill_px = actual_avg_price
-                    elif origin_note:
-                        print(
-                            f"[WARN] 持仓均价查询失败({origin_note})，沿用下单均价 {fill_px:.4f}。"
-                        )
-                    if actual_total_position is not None and actual_total_position > 0:
-                        position_size = actual_total_position
-                    else:
-                        position_size = expected_total_position
+                    fill_px = confirmed_avg
+                    position_size = confirmed_total
                     last_order_size = filled_amt
-                    if actual_avg_price is not None:
-                        display_size = (
-                            actual_total_position
-                            if actual_total_position is not None
-                            else position_size
-                        )
-                        origin_display = origin_note or "positions"
-                        print(
-                            f"[STATE] 持仓均价确认 -> origin={origin_display} avg={fill_px:.4f} size={display_size:.4f}"
-                        )
+                    display_size = (
+                        confirmed_total if confirmed_total is not None else position_size
+                    )
+                    origin_display = origin_note or "positions"
+                    print(
+                        f"[STATE] 持仓均价确认 -> origin={origin_display} avg={fill_px:.4f} size={display_size:.4f}"
+                    )
                     buy_filled_kwargs = {
                         "avg_price": fill_px,
                         "size": filled_amt,
