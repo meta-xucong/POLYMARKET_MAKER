@@ -9,8 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
-from network_guard import interaction_guard
-
 try:  # pragma: no cover - optional dependency
     import yaml
 except ImportError:  # pragma: no cover - fallback to lightweight parser
@@ -292,9 +290,7 @@ class ExecutionEngine:
             "timeInForce": "GTC",
             "allowPartial": True,
         }
-        response = interaction_guard.wait_and_call(
-            "order:submit", lambda: self.api.create_order(payload)
-        )
+        response = self.api.create_order(payload)
         if "orderId" not in response:
             raise RuntimeError("Polymarket API did not return orderId")
         return str(response["orderId"])
@@ -309,14 +305,7 @@ class ExecutionEngine:
         final_statuses: Set[str] = {"FILLED", "CANCELLED", "CANCELED", "MATCHED", "COMPLETED", "EXECUTED"}
 
         while True:
-            status, _ = interaction_guard.cached_call(
-                ("order-status", order_id),
-                1.0,
-                lambda: interaction_guard.wait_and_call(
-                    "order:status", lambda: self.api.get_order_status(order_id)
-                ),
-                channel="order:status",
-            )
+            status = self.api.get_order_status(order_id)
             if not isinstance(status, dict):
                 raise RuntimeError(
                     f"Order status response must be a mapping, got: {status!r}"
@@ -473,19 +462,14 @@ class ClobPolymarketAPI(PolymarketAPI):
 
         order_type = self._resolve_order_type(payload, OrderType)
 
-        signed_or_response = interaction_guard.wait_and_call(
-            "clob:create_order", lambda: self._client.create_order(order_args)
-        )
+        signed_or_response = self._client.create_order(order_args)
 
         order_id = self._extract_order_id(signed_or_response)
         if order_id is not None:
             raw_response = signed_or_response
         else:
             self._apply_order_metadata(signed_or_response, order_type, payload)
-            raw_response = interaction_guard.wait_and_call(
-                "clob:post_order",
-                lambda: self._client.post_order(signed_or_response, order_type),
-            )
+            raw_response = self._client.post_order(signed_or_response, order_type)
             order_id = self._extract_order_id(raw_response)
             if order_id is None:
                 raise RuntimeError(
@@ -582,9 +566,7 @@ class ClobPolymarketAPI(PolymarketAPI):
         last_error: Optional[Exception] = None
         for method in candidate_methods:
             try:
-                raw = interaction_guard.wait_and_call(
-                    "clob:status", lambda: method(order_id)
-                )
+                raw = method(order_id)
                 normalized = self._normalize_status(raw)
                 if normalized:
                     return normalized
