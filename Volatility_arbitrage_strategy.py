@@ -438,6 +438,10 @@ class VolArbStrategy:
             # 清理非 SELL 的等待状态，确保重新触发买入
             self._awaiting = None
 
+        if remaining_size is None:
+            self._price_history.clear()
+            self._reset_drop_metrics()
+
         if avg_price is not None:
             self._last_sell_price = avg_price
         elif self._state == "FLAT":

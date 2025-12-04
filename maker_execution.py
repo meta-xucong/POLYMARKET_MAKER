@@ -903,6 +903,7 @@ def maker_sell_follow_ask_with_floor_wait(
     next_price_override: Optional[float] = None
     # 连续触发仓位不足但接口仍返回可用仓位的计数
     consecutive_insufficient_with_position = 0
+    missing_position_retry = 0
     shortage_retry_count = 0
     try:
         aggressive_timeout = float(aggressive_timeout)
@@ -977,6 +978,8 @@ def maker_sell_follow_ask_with_floor_wait(
                 except (TypeError, ValueError):
                     live_target = None
                 if live_target is not None:
+                    if live_target > goal_cap:
+                        goal_cap = live_target
                     reserved = _active_reserved_size()
                     adjusted_target = (
                         live_target + reserved if reserved > _MIN_FILL_EPS else live_target
@@ -1162,9 +1165,18 @@ def maker_sell_follow_ask_with_floor_wait(
                             except (TypeError, ValueError):
                                 live_target = None
                     if live_target is None:
-                        final_status = "FAILED"
-                        print("[MAKER][SELL] 无法获取最新仓位，退出卖出流程。")
-                        break
+                        missing_position_retry += 1
+                        if missing_position_retry >= 5:
+                            final_status = "FAILED"
+                            print("[MAKER][SELL] 无法获取最新仓位，退出卖出流程。")
+                            break
+                        print(
+                            "[MAKER][SELL] 无法获取最新仓位，等待60s后重试同步。 "
+                            f"(attempt {missing_position_retry}/5)"
+                        )
+                        sleep_fn(60)
+                        continue
+                    missing_position_retry = 0
 
                     dust_cutoff = 0.01
                     if api_min_qty and api_min_qty > dust_cutoff:
