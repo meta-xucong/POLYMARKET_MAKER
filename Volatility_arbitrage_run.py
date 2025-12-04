@@ -79,6 +79,9 @@ POSITION_SYNC_INTERVAL = 60.0
 POST_BUY_POSITION_CHECK_DELAY = 60.0
 POST_BUY_POSITION_CHECK_ATTEMPTS = 5
 POST_BUY_POSITION_CHECK_INTERVAL = 7.0
+POST_BUY_POSITION_CHECK_ROUND_COOLDOWN = 60.0
+POST_BUY_POSITION_MATCH_REL_TOL = 1e-4
+POST_BUY_POSITION_MATCH_ABS_TOL = 1e-6
 
 
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
@@ -3012,12 +3015,10 @@ def main():
 
                     consecutive_hits = 0
                     last_avg: Optional[float] = None
-                    last_total: Optional[float] = None
                     confirmed_avg: Optional[float] = None
                     confirmed_total: Optional[float] = None
                     success_samples: List[Tuple[float, float]] = []
                     round_index = 0
-
                     while confirmed_avg is None or confirmed_total is None:
                         round_index += 1
                         round_success_start = len(success_samples)
@@ -3039,27 +3040,32 @@ def main():
                                 and actual_total_position is not None
                             ):
                                 success_samples.append((actual_avg_price, actual_total_position))
+                                origin_display = origin_note or "positions"
+                                print(
+                                    f"[TRACE] 持仓均价查询结果（第{attempt + 1}次/本轮）"
+                                    f" origin={origin_display} avg={actual_avg_price:.6f} size={actual_total_position:.6f}"
+                                )
                                 if (
                                     last_avg is not None
-                                    and last_total is not None
-                                    and math.isclose(actual_avg_price, last_avg, rel_tol=1e-6, abs_tol=1e-8)
-                                    and math.isclose(actual_total_position, last_total, rel_tol=1e-6, abs_tol=1e-8)
+                                    and math.isclose(
+                                        actual_avg_price,
+                                        last_avg,
+                                        rel_tol=POST_BUY_POSITION_MATCH_REL_TOL,
+                                        abs_tol=POST_BUY_POSITION_MATCH_ABS_TOL,
+                                    )
                                 ):
                                     consecutive_hits += 1
                                 else:
                                     consecutive_hits = 1
                                     last_avg = actual_avg_price
-                                    last_total = actual_total_position
 
-                                expected_total_ok = actual_total_position >= expected_total_position - 1e-6
-                                if consecutive_hits >= 3 and expected_total_ok:
+                                if consecutive_hits >= 3:
                                     confirmed_avg = actual_avg_price
                                     confirmed_total = actual_total_position
                                     break
                             else:
                                 consecutive_hits = 0
                                 last_avg = None
-                                last_total = None
 
                             if attempt < POST_BUY_POSITION_CHECK_ATTEMPTS - 1:
                                 time.sleep(POST_BUY_POSITION_CHECK_INTERVAL)
@@ -3077,18 +3083,18 @@ def main():
                             stop_event.set()
                             break
 
-                        tolerance_kwargs = {"rel_tol": 1e-6, "abs_tol": 1e-8}
+                        tolerance_kwargs = {
+                            "rel_tol": POST_BUY_POSITION_MATCH_REL_TOL,
+                            "abs_tol": POST_BUY_POSITION_MATCH_ABS_TOL,
+                        }
                         for candidate_avg, candidate_total in success_samples:
                             if candidate_total is None:
-                                continue
-                            if candidate_total < expected_total_position - 1e-6:
                                 continue
 
                             match_count = 0
                             for avg_val, total_val in success_samples:
                                 if (
                                     math.isclose(candidate_avg, avg_val, **tolerance_kwargs)
-                                    and math.isclose(candidate_total, total_val, **tolerance_kwargs)
                                 ):
                                     match_count += 1
                             if match_count >= 3:
@@ -3096,15 +3102,15 @@ def main():
                                 confirmed_total = candidate_total
                                 break
 
-                        if confirmed_avg is None or confirmed_total is None:
-                            origin_display = origin_note or "positions"
-                            print(
-                                "[WARN] 持仓均价未满足三次一致确认，继续进入下一轮查询。 "
-                                f"已完成 {round_index * POST_BUY_POSITION_CHECK_ATTEMPTS} 次尝试，origin={origin_display}"
-                            )
-                            consecutive_hits = 0
-                            last_avg = None
-                            last_total = None
+                            if confirmed_avg is None or confirmed_total is None:
+                                origin_display = origin_note or "positions"
+                                print(
+                                    "[WARN] 持仓均价未满足三次一致确认，继续进入下一轮查询。 "
+                                    f"已完成 {round_index * POST_BUY_POSITION_CHECK_ATTEMPTS} 次尝试，origin={origin_display}"
+                                )
+                                consecutive_hits = 0
+                                last_avg = None
+                                time.sleep(POST_BUY_POSITION_CHECK_ROUND_COOLDOWN)
 
                     if stop_event.is_set():
                         return
