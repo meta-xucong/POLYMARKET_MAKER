@@ -42,6 +42,7 @@ from maker_execution import (
     maker_buy_follow_bid,
     maker_sell_follow_ask_with_floor_wait,
 )
+from network_guard import interaction_guard
 
 # ========== 1) Client：优先 ws 版，回退 rest 版 ==========
 def _get_client():
@@ -898,7 +899,9 @@ def _claim_via_http(client, market_id: str, token_id: Optional[str]) -> bool:
     }
 
     try:
-        resp = requests.post(url, data=body, headers=headers, timeout=10)
+        resp = interaction_guard.wait_and_call(
+            "http:claim", lambda: requests.post(url, data=body, headers=headers, timeout=10)
+        )
     except Exception as exc:
         print(f"[CLAIM] 请求 {url} 时出现异常：{exc}")
         return False
@@ -1035,60 +1038,71 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
         return [], False, origin_hint
 
     url = f"{DATA_API_ROOT}/positions"
+    cache_key = ("data-api-positions", address)
 
-    limit = 500
-    offset = 0
-    collected: List[dict] = []
-    total_records: Optional[int] = None
+    def _load_positions() -> Tuple[List[dict], bool, str]:
+        limit = 500
+        offset = 0
+        collected: List[dict] = []
+        total_records: Optional[int] = None
 
-    while True:
-        params = {
-            "user": address,
-            "limit": limit,
-            "offset": offset,
-            "sizeThreshold": 0,
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=10)
-        except requests.RequestException as exc:
-            return [], False, f"数据接口请求失败：{exc}"
-
-        if resp.status_code == 404:
-            return [], False, "数据接口返回 404（请确认使用 Proxy/Deposit 地址查询 user 参数）"
-
-        try:
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            return [], False, f"数据接口请求失败：{exc}"
-
-        try:
-            payload = resp.json()
-        except ValueError:
-            return [], False, "数据接口响应解析失败"
-
-        positions = _extract_positions_from_data_api_response(payload)
-        if positions is None:
-            return [], False, "数据接口返回格式异常，缺少 data 字段。"
-
-        collected.extend(positions)
-        meta = payload.get("meta") if isinstance(payload, dict) else {}
-        if isinstance(meta, dict):
-            raw_total = meta.get("total") or meta.get("count")
+        while True:
+            params = {
+                "user": address,
+                "limit": limit,
+                "offset": offset,
+                "sizeThreshold": 0,
+            }
             try:
-                if raw_total is not None:
-                    total_records = int(raw_total)
-            except (TypeError, ValueError):
-                total_records = None
+                resp = interaction_guard.wait_and_call(
+                    "http:data-api", lambda: requests.get(url, params=params, timeout=10)
+                )
+            except requests.RequestException as exc:
+                return [], False, f"数据接口请求失败：{exc}"
 
-        if not positions or (total_records is not None and len(collected) >= total_records):
-            break
+            if resp.status_code == 404:
+                return [], False, "数据接口返回 404（请确认使用 Proxy/Deposit 地址查询 user 参数）"
 
-        offset += len(positions)
+            try:
+                resp.raise_for_status()
+            except requests.RequestException as exc:
+                return [], False, f"数据接口请求失败：{exc}"
 
-    total = total_records if total_records is not None else len(collected)
-    origin_detail = f" via {origin_hint}" if origin_hint else ""
-    origin = f"data-api positions(limit={limit}, total={total}, param=user){origin_detail}"
-    return collected, True, origin
+            try:
+                payload = resp.json()
+            except ValueError:
+                return [], False, "数据接口响应解析失败"
+
+            positions = _extract_positions_from_data_api_response(payload)
+            if positions is None:
+                return [], False, "数据接口返回格式异常，缺少 data 字段。"
+
+            collected.extend(positions)
+            meta = payload.get("meta") if isinstance(payload, dict) else {}
+            if isinstance(meta, dict):
+                raw_total = meta.get("total") or meta.get("count")
+                try:
+                    if raw_total is not None:
+                        total_records = int(raw_total)
+                except (TypeError, ValueError):
+                    total_records = None
+
+            if not positions or (total_records is not None and len(collected) >= total_records):
+                break
+
+            offset += len(positions)
+
+        total = total_records if total_records is not None else len(collected)
+        origin_detail = f" via {origin_hint}" if origin_hint else ""
+        origin = f"data-api positions(limit={limit}, total={total}, param=user){origin_detail}"
+        return collected, True, origin
+
+    result, from_cache = interaction_guard.cached_call(
+        cache_key, 1.0, _load_positions, channel="http:data-api"
+    )
+    if not from_cache:
+        interaction_guard.log_snapshot(prefix="[DATA-API][METRICS]")
+    return result
 
 
 def _coerce_float(value: Any) -> Optional[float]:
@@ -1317,8 +1331,18 @@ def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
     print("[CLAIM] 未找到可用的 claim 方法，请手动处理。")
 
 def _http_json(url: str, params=None) -> Optional[Any]:
+    cache_key = ("http-json", url, tuple(sorted((params or {}).items())))
+
+    def _do_request():
+        return requests.get(url, params=params or {}, timeout=10)
+
     try:
-        r = requests.get(url, params=params or {}, timeout=10)
+        r, _ = interaction_guard.cached_call(
+            cache_key,
+            1.0,
+            lambda: interaction_guard.wait_and_call("http:gamma", _do_request),
+            channel="http:gamma",
+        )
         if r.status_code == 404:
             return None
         r.raise_for_status()
