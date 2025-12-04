@@ -2262,6 +2262,7 @@ def main():
     pending_buy: Optional[Action] = None
     short_buy_cooldown = 1.0
     next_position_sync: float = 0.0
+    position_sync_block_until: float = 0.0
     awaiting_buy_passthrough: bool = True
     exit_after_sell_only_clear: bool = False
     min_loop_interval = 1.0
@@ -2291,6 +2292,9 @@ def main():
         nonlocal position_size, next_position_sync
         now = time.time()
         if not force and now < next_position_sync:
+            return
+        if now < position_sync_block_until:
+            next_position_sync = max(next_position_sync, position_sync_block_until)
             return
         next_position_sync = now + POSITION_SYNC_INTERVAL
         try:
@@ -2459,7 +2463,7 @@ def main():
         floor_hint: Optional[float],
         source: str,
     ) -> None:
-        nonlocal position_size, last_order_size
+        nonlocal position_size, last_order_size, position_sync_block_until, next_position_sync
 
         position_snapshot_cache: Optional[
             Tuple[Optional[float], Optional[float], Optional[str]]
@@ -2577,6 +2581,12 @@ def main():
             size=sell_filled if sell_filled > 0 else None,
             remaining=remaining_for_strategy,
         )
+        sold_out = remaining_for_strategy is None
+        if sold_out:
+            block_until = time.time() + 60.0
+            position_sync_block_until = max(position_sync_block_until, block_until)
+            next_position_sync_ts = max(next_position_sync, position_sync_block_until)
+            next_position_sync = next_position_sync_ts
         if remaining_for_strategy is None:
             strategy.mark_awaiting(None)
             print(
