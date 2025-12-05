@@ -2493,7 +2493,7 @@ def main():
         floor_hint: Optional[float],
         source: str,
     ) -> None:
-        nonlocal position_size, last_order_size, position_sync_block_until, next_position_sync
+        nonlocal position_size, last_order_size, position_sync_block_until, next_position_sync, next_loop_after
 
         position_snapshot_cache: Optional[
             Tuple[Optional[float], Optional[float], Optional[str]]
@@ -2622,6 +2622,8 @@ def main():
             heartbeat_interval = 60.0
             pause_deadline = time.time() + wait_after_sell_sec
             heartbeat_tick = 1
+            heartbeat_total = int(wait_after_sell_sec // heartbeat_interval)
+            remote_sync_errors = 0
             while True:
                 remaining_wait = pause_deadline - time.time()
                 if remaining_wait <= 0:
@@ -2629,11 +2631,39 @@ def main():
                 sleep_window = min(heartbeat_interval, remaining_wait)
                 if stop_event.wait(sleep_window):
                     break
+                try:
+                    snapshot = _fetch_position_snapshot(log_errors=True, force=True)
+                    if snapshot is None:
+                        print("[STATE][SYNC] 远端仓位查询结果为空或未返回。")
+                    else:
+                        avg_px, total_pos, origin = snapshot
+                        origin_display = origin or "positions"
+                        avg_display = f"{avg_px:.4f}" if avg_px is not None else "-"
+                        if total_pos is None:
+                            size_note = "None"
+                            size_detail = "未知"
+                        else:
+                            size_note = f"{total_pos:.4f}"
+                            size_detail = "空仓" if total_pos <= 0 else "持仓"
+                        print(
+                            "[STATE][SYNC] 远端仓位 -> "
+                            f"origin={origin_display} avg={avg_display} size={size_note} ({size_detail})"
+                        )
+                except Exception as sync_exc:
+                    remote_sync_errors += 1
+                    print(f"[STATE][SYNC] 获取远端仓位异常：{sync_exc}")
                 print(
                     "[STATE] 卖出完成，等待远端仓位同步中… "
-                    f"心跳 {heartbeat_tick}/{int(wait_after_sell_sec // heartbeat_interval)}"
+                    f"心跳 {heartbeat_tick}/{heartbeat_total}"
                 )
                 heartbeat_tick += 1
+            if remote_sync_errors >= heartbeat_total:
+                print(
+                    "[STATE][SYNC] 连续多次获取远端仓位均异常，终止脚本以避免风险。"
+                )
+                stop_event.set()
+                next_loop_after = max(next_loop_after, pause_deadline)
+                return
             next_loop_after = max(next_loop_after, pause_deadline)
         if sell_remaining > eps and not treat_as_dust:
             position_size = sell_remaining
