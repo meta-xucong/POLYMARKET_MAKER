@@ -1159,7 +1159,9 @@ def _extract_position_size_from_entry(entry: Dict[str, Any]) -> Optional[float]:
     for cand in _position_dict_candidates(entry):
         for key in size_keys:
             val = _coerce_float(cand.get(key))
-            if val is not None and val > 0:
+            if val is None:
+                continue
+            if val >= 0:
                 return val
     return None
 
@@ -1287,6 +1289,31 @@ def _lookup_position_avg_price(
             time.sleep(retry_interval)
 
     return None, None, last_info or f"未在 positions 中找到 token {token_id}"
+
+
+def _fetch_position_snapshot_with_cache(
+    *,
+    client,
+    token_id: str,
+    cache: Optional[Tuple[Optional[float], Optional[float], Optional[str]]],
+    cache_ts: float,
+    log_errors: bool,
+    force: bool = False,
+    cache_ttl: float = 2.0,
+) -> Tuple[Optional[Tuple[Optional[float], Optional[float], Optional[str]]], float]:
+    now = time.time()
+    if not force and cache is not None and now - cache_ts <= cache_ttl:
+        return cache, cache_ts
+
+    try:
+        snapshot = _lookup_position_avg_price(client, token_id)
+        return snapshot, now
+    except Exception as probe_exc:
+        if log_errors:
+            print(f"[WATCHDOG][SELL] 持仓查询异常：{probe_exc}")
+        if cache is not None:
+            return cache, cache_ts
+        return None, cache_ts
 
 
 def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
@@ -2475,21 +2502,17 @@ def main():
 
         def _fetch_position_snapshot(*, log_errors: bool, force: bool = False):
             nonlocal position_snapshot_cache, position_snapshot_ts
-            now = time.time()
-            if (
-                not force
-                and position_snapshot_cache is not None
-                and now - position_snapshot_ts <= 2.0
-            ):
-                return position_snapshot_cache
-            try:
-                snapshot = _lookup_position_avg_price(client, token_id)
-            except Exception as probe_exc:
-                if log_errors:
-                    print(f"[WATCHDOG][SELL] 持仓查询异常：{probe_exc}")
-                return None
-            position_snapshot_cache = snapshot
-            position_snapshot_ts = now
+            snapshot, snapshot_ts = _fetch_position_snapshot_with_cache(
+                client=client,
+                token_id=token_id,
+                cache=position_snapshot_cache,
+                cache_ts=position_snapshot_ts,
+                log_errors=log_errors,
+                force=force,
+            )
+            position_snapshot_ts = snapshot_ts
+            if snapshot is not None:
+                position_snapshot_cache = snapshot
             return snapshot
 
         def _resolve_order_qty() -> Optional[float]:
