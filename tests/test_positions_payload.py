@@ -44,6 +44,7 @@ sys.modules["websocket"] = _WebsocketStub()
 
 from Volatility_arbitrage_run import (
     _extract_positions_from_data_api_response,
+    _fetch_position_snapshot_with_cache,
     _fetch_positions_from_data_api,
     _lookup_position_avg_price,
     _merge_remote_position_size,
@@ -171,6 +172,53 @@ def test_fetch_positions_env_fallback(monkeypatch):
     assert calls[0]["user"] == "0xfeed"
 
 
+def test_fetch_position_snapshot_uses_recent_cache(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    now = 1000.0
+    cache = (0.5, 10.0, "cached")
+
+    monkeypatch.setattr(module.time, "time", lambda: now)
+
+    snapshot, ts = _fetch_position_snapshot_with_cache(
+        client=DummyClient(),
+        token_id="abc",
+        cache=cache,
+        cache_ts=now - 1.0,
+        log_errors=False,
+        force=False,
+    )
+
+    assert snapshot == cache
+    assert ts == now - 1.0
+
+
+def test_fetch_position_snapshot_falls_back_to_cache_on_error(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    now = 2000.0
+    cache = (0.42, 5.0, "cached")
+
+    monkeypatch.setattr(module.time, "time", lambda: now)
+    monkeypatch.setattr(
+        module,
+        "_lookup_position_avg_price",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    snapshot, ts = _fetch_position_snapshot_with_cache(
+        client=DummyClient(),
+        token_id="abc",
+        cache=cache,
+        cache_ts=now - 100.0,
+        log_errors=True,
+        force=True,
+    )
+
+    assert snapshot == cache
+    assert ts == now - 100.0
+
+
 def test_lookup_position_avg_price_success(monkeypatch):
     module = __import__("Volatility_arbitrage_run")
 
@@ -204,6 +252,22 @@ def test_lookup_position_avg_price_not_found(monkeypatch):
     assert avg_price is None
     assert pos_size is None
     assert "123" in origin
+
+
+def test_lookup_position_avg_price_zero_size(monkeypatch):
+    module = __import__("Volatility_arbitrage_run")
+
+    sample_positions = [{"tokenId": "123", "avg_price": "0.5", "size": 0}]
+
+    def fake_fetch(client):
+        return sample_positions, True, "mock-origin"
+
+    monkeypatch.setattr(module, "_fetch_positions_from_data_api", fake_fetch)
+
+    avg_price, pos_size, origin = _lookup_position_avg_price(DummyClient(), "123")
+    assert avg_price == 0.5
+    assert pos_size == 0
+    assert origin == "mock-origin"
 
 
 def test_merge_remote_position_size_detects_updates():
