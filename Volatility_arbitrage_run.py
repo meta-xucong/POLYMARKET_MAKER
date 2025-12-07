@@ -84,6 +84,20 @@ POST_BUY_POSITION_MATCH_REL_TOL = 1e-4
 POST_BUY_POSITION_MATCH_ABS_TOL = 1e-6
 
 
+_REQUEST_RATE_LIMIT_SEC = 1.0
+_last_request_ts = 0.0
+_request_lock = threading.Lock()
+
+def _enforce_request_rate_limit() -> None:
+    global _last_request_ts
+    with _request_lock:
+        now = time.monotonic()
+        elapsed = now - _last_request_ts
+        remaining = _REQUEST_RATE_LIMIT_SEC - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+        _last_request_ts = time.monotonic()
+
 def _strategy_accepts_total_position(strategy: VolArbStrategy) -> bool:
     """Return True when ``strategy.on_buy_filled`` can consume ``total_position``."""
 
@@ -898,6 +912,7 @@ def _claim_via_http(client, market_id: str, token_id: Optional[str]) -> bool:
     }
 
     try:
+        _enforce_request_rate_limit()
         resp = requests.post(url, data=body, headers=headers, timeout=10)
     except Exception as exc:
         print(f"[CLAIM] 请求 {url} 时出现异常：{exc}")
@@ -1049,6 +1064,7 @@ def _fetch_positions_from_data_api(client) -> Tuple[List[dict], bool, str]:
             "sizeThreshold": 0,
         }
         try:
+            _enforce_request_rate_limit()
             resp = requests.get(url, params=params, timeout=10)
         except requests.RequestException as exc:
             return [], False, f"数据接口请求失败：{exc}"
@@ -1345,6 +1361,7 @@ def _attempt_claim(client, meta: Dict[str, Any], token_id: str) -> None:
 
 def _http_json(url: str, params=None) -> Optional[Any]:
     try:
+        _enforce_request_rate_limit()
         r = requests.get(url, params=params or {}, timeout=10)
         if r.status_code == 404:
             return None

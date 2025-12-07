@@ -23,6 +23,19 @@ except Exception:
 WS_BASE = "wss://ws-subscriptions-clob.polymarket.com"
 CHANNEL = "market"
 
+_REST_RATE_LIMIT_SEC = 1.0
+_last_rest_call_ts = 0.0
+
+
+def _enforce_rest_rate_limit() -> None:
+    global _last_rest_call_ts
+    now = time.monotonic()
+    elapsed = now - _last_rest_call_ts
+    remaining = _REST_RATE_LIMIT_SEC - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+    _last_rest_call_ts = time.monotonic()
+
 def _now() -> str:
     from datetime import datetime
     return datetime.now().strftime("%H:%M:%S")
@@ -175,6 +188,7 @@ def _resolve_ids_via_rest(source: str):
         slug = _extract_market_slug(source)
         if not slug:
             raise ValueError("无法从 URL 解析出 market slug")
+        _enforce_rest_rate_limit()
         r = requests.get(GAMMA_API, params={"limit": 1, "slug": slug}, timeout=10)
         r.raise_for_status()
         arr = r.json()

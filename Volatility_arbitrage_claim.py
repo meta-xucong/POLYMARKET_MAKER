@@ -24,6 +24,18 @@ from urllib.parse import urlencode
 
 import requests
 
+_CLAIM_RATE_LIMIT_SEC = 1.0
+_last_claim_http_ts = 0.0
+
+def _enforce_claim_rate_limit() -> None:
+    global _last_claim_http_ts
+    now = time.monotonic()
+    elapsed = now - _last_claim_http_ts
+    remaining = _CLAIM_RATE_LIMIT_SEC - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+    _last_claim_http_ts = time.monotonic()
+
 from Volatility_arbitrage_main_rest import get_client
 from Volatility_arbitrage_run import (
     _extract_api_creds,
@@ -218,6 +230,7 @@ def _signed_request(
 
     request_fn = getattr(requests, method.lower())
     try:
+        _enforce_claim_rate_limit()
         resp = request_fn(url, data=body or None, headers=headers, timeout=10)
     except Exception as exc:
         raise RuntimeError(f"请求 {url} 失败：{exc}") from exc
