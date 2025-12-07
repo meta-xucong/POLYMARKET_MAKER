@@ -17,6 +17,19 @@ except Exception:
 
 GAMMA_API = "https://gamma-api.polymarket.com/markets"
 
+_GAMMA_RATE_LIMIT_SEC = 1.0
+_last_gamma_request_ts = 0.0
+
+
+def _enforce_gamma_rate_limit() -> None:
+    global _last_gamma_request_ts
+    now = time.monotonic()
+    elapsed = now - _last_gamma_request_ts
+    remaining = _GAMMA_RATE_LIMIT_SEC - elapsed
+    if remaining > 0:
+        time.sleep(remaining)
+    _last_gamma_request_ts = time.monotonic()
+
 def _is_url(s: str) -> bool:
     return s.startswith("http")
 
@@ -33,6 +46,7 @@ def _gamma_fetch_market_by_slug(slug: str) -> Optional[dict]:
         print("[ERROR] 依赖 requests，请先安装： pip install requests")
         return None
     try:
+        _enforce_gamma_rate_limit()
         r = requests.get(GAMMA_API, params={"limit": 1, "slug": slug}, timeout=10)
         r.raise_for_status()
         arr = r.json()

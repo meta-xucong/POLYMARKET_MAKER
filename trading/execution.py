@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -438,6 +439,20 @@ class ClobPolymarketAPI(PolymarketAPI):
 
     def __init__(self, client) -> None:  # type: ignore[override]
         self._client = client
+        self._min_interval_seconds = 1.0
+        self._last_call_ts = 0.0
+        self._rate_lock = threading.Lock()
+
+    def _enforce_rate_limit(self) -> None:
+        if self._min_interval_seconds <= 0:
+            return
+        with self._rate_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_call_ts
+            remaining = self._min_interval_seconds - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_call_ts = time.monotonic()
 
     def create_order(self, payload: Dict[str, object]) -> Dict[str, object]:
         try:
@@ -462,6 +477,7 @@ class ClobPolymarketAPI(PolymarketAPI):
 
         order_type = self._resolve_order_type(payload, OrderType)
 
+        self._enforce_rate_limit()
         signed_or_response = self._client.create_order(order_args)
 
         order_id = self._extract_order_id(signed_or_response)
@@ -469,6 +485,7 @@ class ClobPolymarketAPI(PolymarketAPI):
             raw_response = signed_or_response
         else:
             self._apply_order_metadata(signed_or_response, order_type, payload)
+            self._enforce_rate_limit()
             raw_response = self._client.post_order(signed_or_response, order_type)
             order_id = self._extract_order_id(raw_response)
             if order_id is None:
@@ -566,6 +583,7 @@ class ClobPolymarketAPI(PolymarketAPI):
         last_error: Optional[Exception] = None
         for method in candidate_methods:
             try:
+                self._enforce_rate_limit()
                 raw = method(order_id)
                 normalized = self._normalize_status(raw)
                 if normalized:
