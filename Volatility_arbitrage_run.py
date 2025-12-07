@@ -3146,12 +3146,13 @@ def main():
                         if len(success_samples) == round_success_start:
                             origin_display = origin_note or "positions"
                             print(
-                                "[FATAL] 持仓均价多轮确认未能获取任何有效结果，停止脚本以避免错误卖出。 "
+                                "[WARN] 持仓均价多轮确认未能获取任何有效结果，暂停 60s 后重试整个查询流程。 "
                                 f"origin={origin_display}"
                             )
-                            strategy.stop("missing avg price after buy")
-                            stop_event.set()
-                            break
+                            consecutive_hits = 0
+                            last_avg = None
+                            time.sleep(60)
+                            continue
 
                         tolerance_kwargs = {
                             "rel_tol": POST_BUY_POSITION_MATCH_REL_TOL,
