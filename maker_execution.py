@@ -906,6 +906,28 @@ def maker_sell_follow_ask_with_floor_wait(
     consecutive_insufficient_with_position = 0
     missing_position_retry = 0
     shortage_retry_count = 0
+    position_refresh_delay_sec = 300.0
+    position_refresh_block_until = 0.0
+    position_refresh_heartbeat_at = 0.0
+    position_refresh_heartbeat_interval = 60.0
+    last_live_position: Optional[float] = None
+
+    def _pull_live_position(tag: str) -> Tuple[Optional[float], Optional[str]]:
+        """调用 position_fetcher 并转换为合法数值，返回 (position, 错误描述)。"""
+
+        if not position_fetcher:
+            return None, "position_fetcher 未配置"
+        try:
+            live_position_raw = position_fetcher()
+        except Exception as exc:  # pragma: no cover - 防御性日志
+            return None, f"{tag} 仓位刷新失败：{exc}"
+        if live_position_raw is None:
+            return None, f"{tag} 仓位刷新返回空值"
+        try:
+            live_target_val = max(_floor_to_dp(float(live_position_raw), SELL_SIZE_DP), 0.0)
+        except (TypeError, ValueError):  # pragma: no cover - 防御性分支
+            return None, f"{tag} 仓位刷新返回非数值：{live_position_raw}"
+        return live_target_val, None
     try:
         aggressive_timeout = float(aggressive_timeout)
     except (TypeError, ValueError):
@@ -968,57 +990,62 @@ def maker_sell_follow_ask_with_floor_wait(
         ):
             interval = max(position_refresh_interval, poll_sec, 1e-6)
             next_position_refresh = now + interval
-            try:
-                live_position = position_fetcher()
-            except Exception as exc:
-                print(f"[MAKER][SELL] 仓位刷新失败：{exc}")
-                live_position = None
-            if live_position is not None:
-                try:
-                    live_target = max(_floor_to_dp(float(live_position), SELL_SIZE_DP), 0.0)
-                except (TypeError, ValueError):
-                    live_target = None
-                if live_target is not None:
-                    if live_target > goal_cap:
-                        goal_cap = live_target
-                    reserved = _active_reserved_size()
-                    adjusted_target = (
-                        live_target + reserved if reserved > _MIN_FILL_EPS else live_target
+            if now < position_refresh_block_until:
+                remaining_wait = max(position_refresh_block_until - now, 0.0)
+                if now >= max(position_refresh_heartbeat_at, 0.0):
+                    print(
+                        "[MAKER][SELL] 成交后等待仓位刷新，剩余 "
+                        f"{int(remaining_wait)}s 冷却。"
                     )
-                    min_goal = max(filled_total, 0.0)
-                    new_goal = _apply_goal_cap(max(adjusted_target, min_goal))
-                    if abs(new_goal - goal_size) > _MIN_FILL_EPS:
-                        change = "扩充" if new_goal > goal_size else "收缩"
-                        prev_goal = goal_size
-                        goal_size = new_goal
-                        remaining = max(goal_size - filled_total, 0.0)
-                        print(
-                            "[MAKER][SELL] 仓位更新 -> "
-                            f"{change}目标至 {goal_size:.{SELL_SIZE_DP}f}"
-                        )
-                        if remaining <= _MIN_FILL_EPS:
-                            if active_order:
-                                _cancel_order(client, active_order)
-                                rec = records.get(active_order)
-                                if rec is not None:
-                                    rec["status"] = "CANCELLED"
-                                active_order = None
-                                active_price = None
-                            final_status = "FILLED"
-                            break
-                        if new_goal < prev_goal - _MIN_FILL_EPS and active_order:
-                            print("[MAKER][SELL] 仓位降低，撤销当前挂单以调整数量")
-                            _cancel_order(client, active_order)
-                            rec = records.get(active_order)
-                            if rec is not None:
-                                rec["status"] = "CANCELLED"
-                            active_order = None
-                            active_price = None
-                            aggressive_timer_start = None
-                            aggressive_timer_anchor_fill = None
-                            aggressive_next_price_override = None
-                            next_price_override = None
-                            continue
+                    position_refresh_heartbeat_at = now + position_refresh_heartbeat_interval
+                continue
+
+            live_target, error_msg = _pull_live_position("定时")
+            if live_target is None:
+                if error_msg:
+                    print(f"[MAKER][SELL] 定时仓位刷新失败：{error_msg}")
+                continue
+            last_live_position = live_target
+            if live_target > goal_cap:
+                goal_cap = live_target
+            reserved = _active_reserved_size()
+            adjusted_target = (
+                live_target + reserved if reserved > _MIN_FILL_EPS else live_target
+            )
+            min_goal = max(filled_total, 0.0)
+            new_goal = _apply_goal_cap(max(adjusted_target, min_goal))
+            if abs(new_goal - goal_size) > _MIN_FILL_EPS:
+                change = "扩充" if new_goal > goal_size else "收缩"
+                prev_goal = goal_size
+                goal_size = new_goal
+                remaining = max(goal_size - filled_total, 0.0)
+                print(
+                    "[MAKER][SELL] 仓位更新 -> "
+                    f"{change}目标至 {goal_size:.{SELL_SIZE_DP}f}"
+                )
+                if remaining <= _MIN_FILL_EPS:
+                    if active_order:
+                        _cancel_order(client, active_order)
+                        rec = records.get(active_order)
+                        if rec is not None:
+                            rec["status"] = "CANCELLED"
+                        active_order = None
+                        active_price = None
+                    final_status = "FILLED"
+                    break
+                if new_goal < prev_goal - _MIN_FILL_EPS and active_order:
+                    print("[MAKER][SELL] 仓位降低，撤销当前挂单以调整数量")
+                    _cancel_order(client, active_order)
+                    rec = records.get(active_order)
+                    if rec is not None:
+                        rec["status"] = "CANCELLED"
+                    active_order = None
+                    active_price = None
+                    aggressive_timer_start = None
+                    aggressive_timer_anchor_fill = None
+                    aggressive_next_price_override = None
+                    next_price_override = None
+                    continue
 
         if api_min_qty and remaining + _MIN_FILL_EPS < api_min_qty:
             final_status = "FILLED_TRUNCATED" if filled_total > _MIN_FILL_EPS else "SKIPPED_TOO_SMALL"
@@ -1152,24 +1179,27 @@ def maker_sell_follow_ask_with_floor_wait(
                     refreshed_goal: Optional[float] = None
                     refreshed_remaining: Optional[float] = None
                     live_target: Optional[float] = None
-                    if position_fetcher:
-                        try:
-                            live_position = position_fetcher()
-                        except Exception as fetch_exc:
-                            print(f"[MAKER][SELL] 仓位刷新失败：{fetch_exc}")
-                            live_position = None
-                        if live_position is not None:
-                            try:
-                                live_target = max(
-                                    _floor_to_dp(float(live_position), SELL_SIZE_DP), 0.0
-                                )
-                            except (TypeError, ValueError):
-                                live_target = None
+                    now = time.time()
+                    blocked_refresh = now < position_refresh_block_until
+                    if blocked_refresh:
+                        remaining_wait = max(position_refresh_block_until - now, 0.0)
+                        print(
+                            "[MAKER][SELL] 成交后等待仓位刷新，跳过本次同步，剩余 "
+                            f"{int(remaining_wait)}s 冷却。"
+                        )
+                    else:
+                        live_target, error_msg = _pull_live_position("余额不足重试")
+                        if live_target is None and error_msg:
+                            print(f"[MAKER][SELL] 无法获取最新仓位：{error_msg}")
                     if live_target is None:
+                        if blocked_refresh:
+                            missing_position_retry = 0
+                            sleep_fn(60)
+                            continue
                         missing_position_retry += 1
                         if missing_position_retry >= 5:
                             final_status = "FAILED"
-                            print("[MAKER][SELL] 无法获取最新仓位，退出卖出流程。")
+                            print("[MAKER][SELL] 无法获取新仓位，退出卖出流程。")
                             break
                         print(
                             "[MAKER][SELL] 无法获取最新仓位，等待60s后重试同步。 "
@@ -1192,6 +1222,7 @@ def maker_sell_follow_ask_with_floor_wait(
 
                     refreshed_goal = _apply_goal_cap(max(filled_total + live_target, filled_total))
                     refreshed_remaining = max(refreshed_goal - filled_total, 0.0)
+                    last_live_position = live_target
                     goal_size = refreshed_goal
                     remaining = refreshed_remaining
                     print(
@@ -1297,8 +1328,13 @@ def maker_sell_follow_ask_with_floor_wait(
             status_text=status_text,
             expected_full_size=record_size,
         )
+        prev_filled_total = filled_total
         filled_total = sum(accounted.values())
         remaining = max(goal_size - filled_total, 0.0)
+        if filled_total > prev_filled_total + _MIN_FILL_EPS:
+            position_refresh_block_until = time.time() + position_refresh_delay_sec
+            position_refresh_heartbeat_at = time.time() + position_refresh_heartbeat_interval
+            print("[MAKER][SELL] 检测到成交，延迟5分钟再同步持仓。")
         status_text_upper = status_text.upper()
         if record is not None:
             record["filled"] = filled_amount
