@@ -103,10 +103,11 @@ def _infer_price_decimals(value: Any, *, max_dp: int = 6) -> Optional[int]:
     else:
         return None
 
-    candidate = candidate.normalize()
-    if candidate.is_zero():
-        return 0
     exponent = candidate.as_tuple().exponent
+    if candidate.is_zero():
+        if exponent < 0:
+            return min(-int(exponent), max_dp)
+        return 0
     if exponent >= 0:
         return 0
     return min(-int(exponent), max_dp)
